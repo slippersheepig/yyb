@@ -8,6 +8,7 @@ RUN CGO_ENABLED=0 GOOS=linux \
 FROM alpine
 WORKDIR /app
 COPY --from=builder /app/yyb-go .
+COPY --from=builder /app/resource ./resource
 EXPOSE 8000
 
 CMD ["./yyb-go", "-host", "0.0.0.0", "-port", "8000"]
