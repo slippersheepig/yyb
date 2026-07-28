@@ -31,6 +31,8 @@ type Config struct {
 	AvatarTimeout  time.Duration
 	ScanTimeout    time.Duration
 	QRSessionTTL   time.Duration
+	APIToken       string
+	AllowedIPs     []string
 }
 
 type App struct {
@@ -105,38 +107,71 @@ func (a *App) Close() error {
 }
 
 func (a *App) Handler() http.Handler {
-	if os.Getenv(gin.EnvGinMode) == "" {
-		gin.SetMode(gin.ReleaseMode)
-	}
+    if os.Getenv(gin.EnvGinMode) == "" {
+        gin.SetMode(gin.ReleaseMode)
+    }
 
-	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery())
+    router := gin.New()
+    router.Use(gin.Logger(), gin.Recovery())
 
-	router.Any("/", gin.WrapF(a.handleIndex))
-	router.Any("/scan", gin.WrapF(a.handleScan))
-	router.Any("/docs", func(c *gin.Context) {
-		c.Redirect(http.StatusMovedPermanently, "/docs/index.html")
-	})
-	router.Any("/docs/*path", gin.WrapF(a.handleDocs))
-	router.Any("/openapi.json", gin.WrapF(a.handleOpenAPI))
-	router.Any("/health", func(c *gin.Context) {
-		writeJSON(c.Writer, http.StatusOK, gin.H{"ok": true})
-	})
-	router.StaticFS("/static", http.Dir(a.resources.Static))
-	router.Any("/qr", gin.WrapF(a.handleQRRoot))
-	router.Any("/qr/*path", gin.WrapF(a.handleQR))
-	router.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
-	router.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
-	router.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
-	router.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
-	router.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
-	router.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
-	router.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
-	router.NoRoute(func(c *gin.Context) {
-		writeError(c.Writer, http.StatusNotFound, "not found")
-	})
+    // ── 公开路由（无需鉴权）──
+    router.Any("/", gin.WrapF(a.handleIndex))
+    router.Any("/scan", gin.WrapF(a.handleScan))
+    router.Any("/health", func(c *gin.Context) {
+        writeJSON(c.Writer, http.StatusOK, gin.H{"ok": true})
+    })
+    router.StaticFS("/static", http.Dir(a.resources.Static))
+    router.Any("/qr", gin.WrapF(a.handleQRRoot))
+    router.Any("/qr/*path", gin.WrapF(a.handleQR))
 
-	return router
+    // ── 受保护路由（需要鉴权）──
+    protected := router.Group("", a.authMiddleware())
+    protected.Any("/docs", func(c *gin.Context) {
+        c.Redirect(http.StatusMovedPermanently, "/docs/index.html")
+    })
+    protected.Any("/docs/*path", gin.WrapF(a.handleDocs))
+    protected.Any("/openapi.json", gin.WrapF(a.handleOpenAPI))
+    protected.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
+    protected.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
+    protected.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
+    protected.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
+    protected.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
+    protected.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
+    protected.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
+
+    router.NoRoute(func(c *gin.Context) {
+        writeError(c.Writer, http.StatusNotFound, "not found")
+    })
+
+    return router
+}
+
+func (a *App) authMiddleware() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        if a.cfg.APIToken == "" && len(a.cfg.AllowedIPs) == 0 {
+            c.Next()
+            return
+        }
+
+        clientIP := c.ClientIP()
+        for _, allowed := range a.cfg.AllowedIPs {
+            if clientIP == allowed {
+                c.Next()
+                return
+            }
+        }
+
+        if a.cfg.APIToken != "" {
+            auth := c.GetHeader("Authorization")
+            if strings.HasPrefix(auth, "Bearer ") && auth[7:] == a.cfg.APIToken {
+                c.Next()
+                return
+            }
+        }
+
+        writeError(c.Writer, http.StatusUnauthorized, "unauthorized")
+        c.Abort()
+    }
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
