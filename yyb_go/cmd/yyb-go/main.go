@@ -15,6 +15,20 @@ import (
 	"yyb_go/internal/httpapi"
 )
 
+func parseAllowedIPs(s string) []string {
+    if s == "" {
+        return nil
+    }
+    var ips []string
+    for _, ip := range strings.Split(s, ",") {
+        ip = strings.TrimSpace(ip)
+        if ip != "" {
+            ips = append(ips, ip)
+        }
+    }
+    return ips
+}
+
 func main() {
 	host := flag.String("host", "127.0.0.1", "listen host")
 	port := flag.Int("port", 8000, "listen port")
@@ -32,6 +46,8 @@ func main() {
 		AvatarTimeout:  10 * time.Second,
 		ScanTimeout:    180 * time.Second,
 		QRSessionTTL:   5 * time.Minute,
+		APIToken:       os.Getenv("YYB_API_TOKEN"),
+		AllowedIPs:     parseAllowedIPs(os.Getenv("YYB_ALLOWED_IPS")),
 	}
 
 	app, err := httpapi.NewApp(cfg)
