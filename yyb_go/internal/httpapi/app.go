@@ -20,6 +20,7 @@ import (
 	"yyb_go/internal/protocol"
 	"yyb_go/internal/qr"
 	"yyb_go/internal/store"
+	"yyb_go/internal/tgbot"
 )
 
 type Config struct {
@@ -33,6 +34,8 @@ type Config struct {
 	QRSessionTTL   time.Duration
 	APIToken       string
 	AllowedIPs     []string
+	TGBotToken     string
+	TGAdminIDs     []int64
 }
 
 type App struct {
@@ -41,6 +44,7 @@ type App struct {
 	db        *store.DB
 	pool      *protocol.Pool
 	qr        *qr.Client
+	tgBot     *tgbot.Bot
 
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session
@@ -105,6 +109,12 @@ func (a *App) Close() error {
 	}
 	return nil
 }
+
+// DB returns the underlying store.DB (used by the Telegram bot).
+func (a *App) DB() *store.DB { return a.db }
+
+// SetTelegramBot wires the bot so the App can push login notifications.
+func (a *App) SetTelegramBot(bot *tgbot.Bot) { a.tgBot = bot }
 
 func (a *App) Handler() http.Handler {
     if os.Getenv(gin.EnvGinMode) == "" {
@@ -595,7 +605,21 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 	nick := pickNickname(userInfo, creds.Nickname)
 	avatar := a.resolveAvatar(ctx, openid, userInfo)
 	status := "alive"
-	return a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMap(), &status)
+	acc, err := a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMap(), &status)
+	if err != nil {
+		return nil, err
+	}
+	// Notify Telegram admins about the new login.
+	if a.tgBot != nil && acc != nil {
+		ev := tgbot.NewLoginEvent{
+			OpenID:   acc.OpenID,
+			Nickname: nick,
+			UIN:      acc.UIN,
+			Avatar:   avatar,
+		}
+		a.tgBot.NotifyLogin(ev)
+	}
+	return acc, nil
 }
 
 func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) string {
