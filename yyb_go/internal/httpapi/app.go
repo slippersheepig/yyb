@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +36,8 @@ type Config struct {
 	AllowedIPs     []string
 	TGBotToken     string
 	TGAdminIDs     []int64
+	WebUser        string
+	WebPass        string
 }
 
 type App struct {
@@ -45,6 +47,7 @@ type App struct {
 	pool      *protocol.Pool
 	qr        *qr.Client
 	tgBot     *tgbot.Bot
+	webAuth   *WebSessionManager
 
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session
@@ -93,6 +96,7 @@ func NewApp(cfg Config) (*App, error) {
 	poolCfg.ShortlinkTimeout = cfg.RequestTimeout
 	poolCfg.TCPProxy = cfg.TCPProxy
 	pool := protocol.NewPool(poolCfg, db)
+	webAuth := NewWebSessionManager(cfg.WebUser, cfg.WebPass)
 	return &App{
 		cfg:        cfg,
 		resources:  res,
@@ -100,6 +104,7 @@ func NewApp(cfg Config) (*App, error) {
 		pool:       pool,
 		qr:         qr.NewClient(cfg.RequestTimeout),
 		qrSessions: map[string]*qr.Session{},
+		webAuth:   webAuth,
 	}, nil
 }
 
@@ -127,12 +132,25 @@ func (a *App) Handler() http.Handler {
     // ── 公开路由（无需鉴权）──
     router.Any("/", gin.WrapF(a.handleIndex))
     router.Any("/scan", gin.WrapF(a.handleScan))
+    router.Any("/login", gin.WrapF(a.handleLogin))
+    router.Any("/logout", gin.WrapF(a.handleLogout))
     router.Any("/health", func(c *gin.Context) {
         writeJSON(c.Writer, http.StatusOK, gin.H{"ok": true})
     })
     router.StaticFS("/static", http.Dir(a.resources.Static))
     router.Any("/qr", gin.WrapF(a.handleQRRoot))
     router.Any("/qr/*path", gin.WrapF(a.handleQR))
+
+    // ── Web 管理路由（需 admin session）──
+    adminGroup := router.Group("", a.RequireAdminAuth())
+    adminGroup.Any("/admin", gin.WrapF(a.handleAdmin))
+    adminGroup.Any("/api/admin/accounts", gin.WrapF(a.handleAdminAccounts))
+    adminGroup.Any("/api/admin/accounts/refresh", gin.WrapF(a.handleAdminRefresh))
+
+    // ── 用户路由（需 user session 或 admin session）──
+    userGroup := router.Group("", a.RequireUserAuth())
+    userGroup.Any("/my", gin.WrapF(a.handleMy))
+    userGroup.Any("/api/my/status", gin.WrapF(a.handleMyStatus))
 
     // ── 受保护路由（需要鉴权）──
     protected := router.Group("", a.authMiddleware())
@@ -173,7 +191,7 @@ func (a *App) authMiddleware() gin.HandlerFunc {
 
         if a.cfg.APIToken != "" {
             auth := c.GetHeader("Authorization")
-            if strings.HasPrefix(auth, "Bearer ") && auth[7:] == a.cfg.APIToken {
+            if strings.HasPrefix(auth, "Bearer ") && subtle.ConstantTimeCompare([]byte(auth[7:]), []byte(a.cfg.APIToken)) == 1 {
                 c.Next()
                 return
             }
@@ -193,6 +211,12 @@ func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// Check admin session; redirect to login if not authenticated
+	cookie, err := r.Cookie("yyb_admin")
+	if err != nil || !a.webAuth.IsValidAdmin(cookie.Value) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
 	serveFileOrText(w, r, filepath.Join(a.resources.Templates, "index.html"), fallbackIndexHTML)
 }
 
@@ -202,6 +226,74 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serveFileOrText(w, r, filepath.Join(a.resources.Templates, "scan.html"), fallbackScanHTML)
+}
+
+func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		serveFileOrText(w, r, filepath.Join(a.resources.Templates, "login.html"), fallbackLoginHTML)
+	case http.MethodPost:
+		r.ParseForm()
+		user := r.FormValue("username")
+		pass := r.FormValue("password")
+		if a.webAuth.CheckAdminLogin(user, pass) {
+			token, expiry := a.webAuth.CreateAdminSession(24 * time.Hour)
+			http.SetCookie(w, &http.Cookie{
+				Name:    "yyb_admin",
+				Value:   token,
+				Path:    "/",
+				Expires: expiry,
+				HttpOnly: true,
+				Secure:  true,
+			})
+			writeJSON(w, http.StatusOK, gin.H{"ok": true, "redirect": "/admin"})
+		} else {
+			writeError(w, http.StatusUnauthorized, "invalid credentials")
+		}
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	cookie, err := r.Cookie("yyb_admin")
+	if err == nil {
+		a.webAuth.DestroyAdminSession(cookie.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:    "yyb_admin",
+		Value:   "",
+		Path:    "/",
+		MaxAge:  -1,
+		HttpOnly: true,
+		Secure:  true,
+	})
+	writeJSON(w, http.StatusOK, gin.H{"ok": true, "redirect": "/login"})
+}
+
+func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	serveFileOrText(w, r, filepath.Join(a.resources.Templates, "index.html"), fallbackIndexHTML)
+}
+
+func (a *App) handleMy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	src := filepath.Join(a.resources.Templates, "user.html")
+	if _, err := os.Stat(src); err != nil {
+		serveFileOrText(w, r, src, fallbackMyHTML)
+		return
+	}
+	http.ServeFile(w, r, src)
 }
 
 func (a *App) handleDocs(w http.ResponseWriter, r *http.Request) {
@@ -328,7 +420,20 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.dropQRSession(sessionID)
-		writeJSON(w, http.StatusOK, acc.Public())
+		// Create a user session and set cookie for the scanning user.
+		userToken, err := a.db.CreateUserSession(r.Context(), acc.ID, 7*24*time.Hour)
+		if err == nil && userToken != "" {
+			http.SetCookie(w, &http.Cookie{
+				Name:    "yyb_user",
+				Value:   userToken,
+				Path:    "/",
+				Expires: time.Now().Add(7 * 24 * time.Hour),
+				HttpOnly: true,
+				Secure:  true,
+			})
+		}
+		resp := gin.H{"account": acc.Public(), "session_token": userToken, "redirect": "/my"}
+		writeJSON(w, http.StatusOK, resp)
 	default:
 		writeError(w, http.StatusNotFound, "qr session not found")
 	}
@@ -829,12 +934,6 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 	})
 }
 
-func requestLogger(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-	})
-}
-
 func serveFileOrText(w http.ResponseWriter, r *http.Request, path, fallback string) {
 	if _, err := os.Stat(path); err == nil {
 		http.ServeFile(w, r, path)
@@ -875,11 +974,84 @@ func safeName(s string) string {
 	return b.String()
 }
 
-func sortedKeys[M ~map[string]V, V any](m M) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+// ── Web 管理 handler 函数 ─────────────────────────────────────────────
+
+func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
 	}
-	sort.Strings(keys)
-	return keys
+	accounts, err := a.db.ListAccounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]store.AccountPublic, 0, len(accounts))
+	for _, acc := range accounts {
+		out = append(out, acc.Public())
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *App) handleAdminRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accounts, err := a.db.ListAccounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]map[string]any, 0, len(accounts))
+	for _, acc := range accounts {
+		out = append(out, refreshOut(acc, a.refreshLiveness(r.Context(), acc)))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *App) handleMyStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	token, _ := getCookie(r, "yyb_user")
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	sess, err := a.db.GetUserSession(r.Context(), token)
+	if err != nil || sess == nil {
+		writeError(w, http.StatusUnauthorized, "会话已过期")
+		return
+	}
+	adminCookie, _ := getCookie(r, "yyb_admin")
+	isAdmin := adminCookie != "" && a.webAuth.IsValidAdmin(adminCookie)
+	if isAdmin {
+		accounts, err := a.db.ListAccounts(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out := make([]store.AccountPublic, 0, len(accounts))
+		for _, acc := range accounts {
+			out = append(out, acc.Public())
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"is_admin": true, "accounts": out})
+		return
+	}
+	acc, err := a.db.GetAccount(r.Context(), sess.WechatAccountID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"is_admin": false, "account": acc.Public()})
+}
+
+func getCookie(r *http.Request, name string) (string, error) {
+	c, err := r.Cookie(name)
+	if err != nil {
+		return "", err
+	}
+	return c.Value, nil
 }
