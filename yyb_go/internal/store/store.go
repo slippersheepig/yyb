@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +46,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     UNIQUE(wechat_account_id, tcp_proxy)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+    session_token TEXT NOT NULL UNIQUE,
+    wechat_account_id INTEGER NOT NULL REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_token ON user_sessions(session_token);
 
 CREATE TABLE IF NOT EXISTS features (
     code        INTEGER PRIMARY KEY,
@@ -110,6 +120,13 @@ type Feature struct {
 	Enabled     bool    `json:"enabled"`
 }
 
+type UserSession struct {
+	SessionToken    string `json:"session_token"`
+	WechatAccountID int64  `json:"wechat_account_id"`
+	CreatedAt       int64  `json:"created_at"`
+	ExpiresAt       int64  `json:"expires_at"`
+}
+
 func Open(path string) (*DB, error) {
 	if path != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -132,7 +149,10 @@ func Open(path string) (*DB, error) {
 		_, _ = db.ExecContext(ctx, "PRAGMA journal_mode=WAL")
 	}
 	_, _ = db.ExecContext(ctx, "PRAGMA synchronous=NORMAL")
-	_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys=ON")
+	if _, err = db.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err = migrateSessionsTable(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -147,6 +167,56 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+func (db *DB) CreateUserSession(ctx context.Context, accountID int64, ttl time.Duration) (string, error) {
+	token, err := generateSessionToken()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().Unix()
+	expiresAt := now + int64(ttl.Seconds())
+	_, err = db.sql.ExecContext(ctx,
+		"INSERT INTO user_sessions(session_token, wechat_account_id, created_at, expires_at) VALUES(?,?,?,?)",
+		token, accountID, now, expiresAt,
+	)
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (db *DB) GetUserSession(ctx context.Context, token string) (*UserSession, error) {
+	row := db.sql.QueryRowContext(ctx,
+		"SELECT session_token, wechat_account_id, created_at, expires_at FROM user_sessions WHERE session_token=? AND expires_at>?",
+		token, time.Now().Unix(),
+	)
+	var s UserSession
+	if err := row.Scan(&s.SessionToken, &s.WechatAccountID, &s.CreatedAt, &s.ExpiresAt); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (db *DB) DeleteUserSession(ctx context.Context, token string) error {
+	_, err := db.sql.ExecContext(ctx, "DELETE FROM user_sessions WHERE session_token=?", token)
+	return err
+}
+
+func (db *DB) PurgeExpiredUserSessions(ctx context.Context) (int64, error) {
+	res, err := db.sql.ExecContext(ctx, "DELETE FROM user_sessions WHERE expires_at<=?", time.Now().Unix())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func generateSessionToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (db *DB) Close() error {
