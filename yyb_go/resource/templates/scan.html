@@ -78,14 +78,16 @@
     async function confirm(){
       $('countdown').textContent='';setStatus('授权成功，正在入库...','s-ok');
       try{
-        const acc=await api('POST',`/qr/${sid}/confirm`);
+        const resp=await api('POST',`/qr/${sid}/confirm`);
+        const acc=resp.account||resp;
+        const redirect=resp.redirect||'/my';
         setStatus('✓ 登录成功','s-ok');
-        const name=acc.nickname||acc.openid||'账号';
+        const name=resp.account?(resp.account.nickname||resp.account.openid||'账号'):(acc.nickname||acc.openid||'账号');
         $('accBox').style.display='block';
         $('accBox').innerHTML=`<div>账号：<b>${name}</b></div><div>状态：${acc.status||'alive'}</div>`;
         $('qrWrap').innerHTML='<div style="font-size:48px;color:#52c41a">✓</div>';
         // Redirect to /my after 2 seconds
-        setTimeout(()=>{location.href=acc.redirect||'/my'},2000)
+        setTimeout(()=>{location.href=redirect},2000)
       }catch(e){setStatus('入库失败: '+(e.message||''),'s-err')}
     }
     $('refreshBtn').addEventListener('click',newQr);
