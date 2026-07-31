@@ -176,7 +176,8 @@ func (a *App) Handler() http.Handler {
 
 func (a *App) authMiddleware() gin.HandlerFunc {
     return func(c *gin.Context) {
-        if a.cfg.APIToken == "" && len(a.cfg.AllowedIPs) == 0 {
+        adminCookie, err := c.Cookie("yyb_admin")
+        if err == nil && a.webAuth.IsValidAdmin(adminCookie) {
             c.Next()
             return
         }
@@ -197,8 +198,7 @@ func (a *App) authMiddleware() gin.HandlerFunc {
             }
         }
 
-        writeError(c.Writer, http.StatusUnauthorized, "unauthorized")
-        c.Abort()
+        c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": 401, "msg": "unauthorized", "data": nil})
     }
 }
 
