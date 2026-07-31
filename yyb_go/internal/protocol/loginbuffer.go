@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"crypto/rand"
 	"net/http"
 	"time"
 )
@@ -171,6 +171,9 @@ func (c *LoginBufferClient) RefreshLoginBuffer(ctx context.Context, creds LoginB
 
 func (c *LoginBufferClient) FetchUserInfo(ctx context.Context, creds LoginBufferCredentials) (map[string]any, error) {
 	ts, nonce := timestampMS(), nonce4()
+	var rn [2]byte
+	_, _ = rand.Read(rn[:])
+	rid := int(rn[0])<<8 | int(rn[1])
 	var data map[string]any
 	err := c.requestJSON(ctx, http.MethodGet, userInfoURL, nil, map[string]string{
 		"Ual-Access-Access-Token": creds.AccessToken,
@@ -179,7 +182,7 @@ func (c *LoginBufferClient) FetchUserInfo(ctx context.Context, creds LoginBuffer
 		"Ual-Access-Businessid":   "pc_yyb",
 		"Ual-Access-Guid":         "web",
 		"Ual-Access-Nonce":        nonce,
-		"Ual-Access-Requestid":    fmt.Sprintf("%d", rand.Intn(9000)+1000),
+		"Ual-Access-Requestid":    fmt.Sprintf("%d", rid%9000+1000),
 		"Ual-Access-Signature":    sign("", nonce, ts, ""),
 		"Ual-Access-Timestamp":    ts,
 	}, &data)
@@ -207,7 +210,7 @@ func (c *LoginBufferClient) requestJSON(ctx context.Context, method, url string,
 		return err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return err
 	}
@@ -256,7 +259,9 @@ func timestampMS() string {
 }
 
 func nonce4() string {
-	return fmt.Sprintf("%d", rand.Intn(10000))
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x", b)
 }
 
 func sign(body, nonce, ts, key string) string {
