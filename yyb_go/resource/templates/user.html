@@ -139,7 +139,9 @@
 
     async function loadMyStatus() {
       try {
-        const acc = await api('GET', '/api/my/status');
+        const resp = await api('GET', '/api/my/status');
+        if (resp.is_admin) { location.href = '/admin'; return; }
+        const acc = resp.account || resp;
         const card = $('userCard');
         const name = acc.nickname || acc.alias || '微信用户';
         card.innerHTML = `
