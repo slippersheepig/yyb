@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>我的账号</title>
+  <style>
+    *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+    body{background:#f0f2f5;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#1a1a2e}
+    .card{background:#fff;width:420px;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.06);padding:32px}
+    .title{font-size:18px;font-weight:700;margin-bottom:24px;text-align:center}
+    .avatar-wrap{width:72px;height:72px;border-radius:50%;margin:0 auto 16px;overflow:hidden;background:#f5f5f5;border:2px solid #e8e8e8}
+    .avatar-wrap img{width:100%;height:100%;object-fit:cover}
+    .avatar-wrap .placeholder{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;color:#bbb}
+    .info{background:#f9fafb;border:1px solid #e8e8e8;border-radius:10px;padding:18px;margin-bottom:16px}
+    .row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;font-size:14px}
+    .row .label{color:#909399;font-weight:500}
+    .row .value{font-weight:600;text-align:right;word-break:break-all;font-size:13px}
+    .status-badge{display:inline-flex;align-items:center;gap:6px;padding:3px 12px;border-radius:999px;font-size:12px;font-weight:600}
+    .status-alive{background:#e6f7e6;color:#52c41a}
+    .status-expired{background:#fff2f0;color:#ff4d4f}
+    .status-unknown{background:#f5f5f5;color:#8c8c8c}
+    .actions{display:flex;gap:12px;margin-top:20px}
+    .btn{flex:1;padding:10px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;text-align:center}
+    .btn-logout{background:#f5f5f5;color:#606266}
+    .btn-logout:hover{background:#e8e8e8}
+    .btn-scan{background:#1a1a2e;color:#fff}
+    .btn-scan:hover{background:#2d2d44}
+    .loading{text-align:center;color:#909399;padding:40px 0}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="title">我的账号状态</div>
+    <div id="content">
+      <div class="loading">加载中...</div>
+    </div>
+    <div class="actions" id="actions" style="display:none">
+      <a class="btn btn-scan" href="/scan">重新扫码</a>
+      <a class="btn btn-logout" href="/logout">退出</a>
+    </div>
+  </div>
+  <script>
+    fetch('/api/my/status').then(r=>r.json()).then(d=>{
+      if(d.code!==0){location.href='/scan';return}
+      const c=document.getElementById('content');
+      const a=document.getElementById('actions');
+      if(d.data.is_admin){location.href='/';return}
+      const acc=d.data.account;
+      const nick=acc.nickname||'(未命名)';
+      const status=acc.status||'未知';
+      const statusCls=status==='alive'?'status-alive':status==='expired'?'status-expired':'status-unknown';
+      const statusText=status==='alive'?'✅ 可用':status==='expired'?'⚠️ 需重扫':'❓ '+status;
+      const avatar=acc.avatar?('':`<img src="/accounts/avatar?ref=${encodeURIComponent(acc.openid)}" alt="">`):`<div class="placeholder">${nick.charAt(0).toUpperCase()}</div>`;
+      const avatarHtml=acc.avatar?`<img src="/accounts/avatar?ref=${encodeURIComponent(acc.openid)}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="placeholder" style="display:none">${nick.charAt(0).toUpperCase()}</div>`:`<div class="placeholder">${nick.charAt(0).toUpperCase()}</div>`;
+      c.innerHTML=`
+        <div class="avatar-wrap">${avatarHtml}</div>
+        <div class="info">
+          <div class="row"><span class="label">昵称</span><span class="value">${nick}</span></div>
+          <div class="row"><span class="label">UIN</span><span class="value">${acc.uin||'-'}</span></div>
+          <div class="row"><span class="label">状态</span><span class="value"><span class="status-badge ${statusCls}">${statusText}</span></span></div>
+          <div class="row"><span class="label">OpenID</span><span class="value" style="font-size:11px">${acc.openid}</span></div>
+        </div>`;
+      a.style.display='flex';
+    }).catch(()=>{location.href='/scan'});
+  </script>
+</body>
+</html>
