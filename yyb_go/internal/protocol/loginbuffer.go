@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"crypto/rand"
+	"math/rand"
 	"net/http"
 	"time"
 )
@@ -171,9 +171,6 @@ func (c *LoginBufferClient) RefreshLoginBuffer(ctx context.Context, creds LoginB
 
 func (c *LoginBufferClient) FetchUserInfo(ctx context.Context, creds LoginBufferCredentials) (map[string]any, error) {
 	ts, nonce := timestampMS(), nonce4()
-	var rn [2]byte
-	_, _ = rand.Read(rn[:])
-	rid := int(rn[0])<<8 | int(rn[1])
 	var data map[string]any
 	err := c.requestJSON(ctx, http.MethodGet, userInfoURL, nil, map[string]string{
 		"Ual-Access-Access-Token": creds.AccessToken,
@@ -182,7 +179,7 @@ func (c *LoginBufferClient) FetchUserInfo(ctx context.Context, creds LoginBuffer
 		"Ual-Access-Businessid":   "pc_yyb",
 		"Ual-Access-Guid":         "web",
 		"Ual-Access-Nonce":        nonce,
-		"Ual-Access-Requestid":    fmt.Sprintf("%d", rid%9000+1000),
+		"Ual-Access-Requestid":    fmt.Sprintf("%d", rand.Intn(9000)+1000),
 		"Ual-Access-Signature":    sign("", nonce, ts, ""),
 		"Ual-Access-Timestamp":    ts,
 	}, &data)
@@ -259,9 +256,7 @@ func timestampMS() string {
 }
 
 func nonce4() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("%x", b)
+	return fmt.Sprintf("%d", rand.Intn(10000))
 }
 
 func sign(body, nonce, ts, key string) string {
