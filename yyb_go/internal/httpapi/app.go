@@ -236,15 +236,26 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		user := r.FormValue("username")
 		pass := r.FormValue("password")
+		// 也支持 JSON body: {"username":"...","password":"..."}
+		if user == "" || pass == "" {
+			var body struct {
+				Username string `json:"username"`
+				Password string `json:"password"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				user = body.Username
+				pass = body.Password
+			}
+		}
 		if a.webAuth.CheckAdminLogin(user, pass) {
 			token, expiry := a.webAuth.CreateAdminSession(24 * time.Hour)
 			http.SetCookie(w, &http.Cookie{
-				Name:    "yyb_admin",
-				Value:   token,
-				Path:    "/",
-				Expires: expiry,
+				Name:     "yyb_admin",
+				Value:    token,
+				Path:     "/",
+				Expires:  expiry,
 				HttpOnly: true,
-				Secure:  true,
+				SameSite: http.SameSiteLaxMode,
 			})
 			writeJSON(w, http.StatusOK, gin.H{"ok": true, "redirect": "/admin"})
 		} else {
@@ -265,12 +276,12 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 		a.webAuth.DestroyAdminSession(cookie.Value)
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:    "yyb_admin",
-		Value:   "",
-		Path:    "/",
-		MaxAge:  -1,
+		Name:     "yyb_admin",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:  true,
+		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, http.StatusOK, gin.H{"ok": true, "redirect": "/login"})
 }
@@ -424,12 +435,12 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 		userToken, err := a.db.CreateUserSession(r.Context(), acc.ID, 7*24*time.Hour)
 		if err == nil && userToken != "" {
 			http.SetCookie(w, &http.Cookie{
-				Name:    "yyb_user",
-				Value:   userToken,
-				Path:    "/",
-				Expires: time.Now().Add(7 * 24 * time.Hour),
+				Name:     "yyb_user",
+				Value:    userToken,
+				Path:     "/",
+				Expires:  time.Now().Add(7 * 24 * time.Hour),
 				HttpOnly: true,
-				Secure:  true,
+				SameSite: http.SameSiteLaxMode,
 			})
 		}
 		resp := gin.H{"account": acc.Public(), "session_token": userToken, "redirect": "/my"}
