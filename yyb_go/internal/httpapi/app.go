@@ -152,6 +152,7 @@ func (a *App) Handler() http.Handler {
     userGroup := router.Group("", a.RequireUserAuth())
     userGroup.Any("/my", gin.WrapF(a.handleMy))
     userGroup.Any("/api/my/status", gin.WrapF(a.handleMyStatus))
+    userGroup.Any("/api/my/avatar", gin.WrapF(a.handleMyAvatar))
 
     // ── 受保护路由（需要鉴权）──
     protected := router.Group("", a.authMiddleware())
@@ -1097,4 +1098,27 @@ func getCookie(r *http.Request, name string) (string, error) {
 		return "", err
 	}
 	return c.Value, nil
+}
+
+func (a *App) handleMyAvatar(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	token, _ := getCookie(r, "yyb_user")
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	sess, err := a.db.GetUserSession(r.Context(), token)
+	if err != nil || sess == nil {
+		writeError(w, http.StatusUnauthorized, "会话已过期")
+		return
+	}
+	acc, err := a.db.GetAccount(r.Context(), sess.WechatAccountID)
+	if err != nil || acc == nil {
+		writeError(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	a.serveAvatar(w, r, acc)
 }
