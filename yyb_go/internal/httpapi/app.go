@@ -146,6 +146,7 @@ func (a *App) Handler() http.Handler {
     adminGroup.Any("/admin", gin.WrapF(a.handleAdmin))
     adminGroup.Any("/api/admin/accounts", gin.WrapF(a.handleAdminAccounts))
     adminGroup.Any("/api/admin/accounts/refresh", gin.WrapF(a.handleAdminRefresh))
+    adminGroup.Any("/api/admin/accounts/delete", gin.WrapF(a.handleAdminDelete))
 
     // ── 用户路由（需 user session 或 admin session）──
     userGroup := router.Group("", a.RequireUserAuth())
@@ -1002,6 +1003,37 @@ func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 		out = append(out, acc.Public())
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *App) handleAdminDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Ref string `json:"ref"`
+	}
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if body.Ref == "" {
+		body.Ref = r.URL.Query().Get("ref")
+	}
+	if body.Ref == "" {
+		writeError(w, http.StatusBadRequest, "ref is required")
+		return
+	}
+	acc, err := a.db.ResolveAccount(r.Context(), body.Ref)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "account not found: "+body.Ref)
+		return
+	}
+	if err := a.db.DeleteAccount(r.Context(), acc.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": acc.ID, "openid": acc.OpenID})
 }
 
 func (a *App) handleAdminRefresh(w http.ResponseWriter, r *http.Request) {
