@@ -75,6 +75,8 @@ func main() {
 		AllowedIPs:     parseAllowedIPs(os.Getenv("YYB_ALLOWED_IPS")),
 		TGBotToken:     os.Getenv("TG_BOT_TOKEN"),
 		TGAdminIDs:     parseAdminIDs(os.Getenv("TG_ADMIN_IDS")),
+		WebUser:        os.Getenv("YYB_WEB_USER"),
+		WebPass:        os.Getenv("YYB_WEB_PASS"),
 	}
 
 	app, err := httpapi.NewApp(cfg)
