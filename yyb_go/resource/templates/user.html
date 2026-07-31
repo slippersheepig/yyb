@@ -147,7 +147,7 @@
         card.innerHTML = `
           <div class="card-header">
             <div class="avatar">
-              <img src="/accounts/avatar?ref=${encodeURIComponent(acc.openid)}" onerror="this.style.display='none';this.parentElement.textContent='${escapeHTML(name.slice(0,1))}'">
+              <img src="/api/my/avatar" onerror="this.style.display='none';this.parentElement.textContent='${escapeHTML(name.slice(0,1))}'">
             </div>
             <div>
               <h1>${escapeHTML(name)}</h1>
