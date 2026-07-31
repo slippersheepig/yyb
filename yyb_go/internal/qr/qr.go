@@ -140,7 +140,7 @@ func (c *Client) FetchQRCodeImage(ctx context.Context, sess *Session) ([]byte, e
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("QR image HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 }
 
 func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, error) {
