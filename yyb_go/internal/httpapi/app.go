@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -106,6 +107,84 @@ func NewApp(cfg Config) (*App, error) {
 		qrSessions: map[string]*qr.Session{},
 		webAuth:   webAuth,
 	}, nil
+}
+
+// StartAutoRefresh launches a background goroutine that periodically refreshes
+// all alive accounts' credentials before they expire.
+//
+// Strategy:
+//   - Check every 90 minutes (low frequency)
+//   - Only refresh accounts whose access token expires within 30 minutes
+//   - On refresh failure, retry up to 2 times with 10s delay
+//   - If all retries fail, mark account as "expired" (no notification)
+//   - No Telegram notifications; if it expires, it expires
+func (a *App) StartAutoRefresh(ctx context.Context) {
+	ticker := time.NewTicker(90 * time.Minute)
+	defer ticker.Stop()
+	// Run once on startup after a short delay to let the server bind first.
+	time.Sleep(10 * time.Second)
+	a.autoRefreshAll(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.autoRefreshAll(ctx)
+		}
+	}
+}
+
+func (a *App) autoRefreshAll(ctx context.Context) {
+	accounts, err := a.db.ListAccounts(ctx)
+	if err != nil {
+		log.Printf("[autoRefresh] ListAccounts error: %v", err)
+		return
+	}
+	now := time.Now().Unix()
+	const refreshWindow = 30 * 60 // 30 minutes before expiry
+	for _, acc := range accounts {
+		// Skip accounts without credentials or already expired
+		if acc.Credentials == nil {
+			continue
+		}
+		if acc.Status != nil && *acc.Status == "expired" {
+			continue
+		}
+		creds := protocol.CredentialsFromMap(acc.Credentials)
+		// Only refresh if within the refresh window (close to expiry)
+		if creds.ExpiresAt > now+refreshWindow {
+			continue // Still plenty of time, skip
+		}
+		a.refreshOneAccount(ctx, acc)
+	}
+}
+
+func (a *App) refreshOneAccount(ctx context.Context, acc *store.WechatAccount) {
+	const maxRetries = 2
+	const retryDelay = 10 * time.Second
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		creds := protocol.CredentialsFromMap(acc.Credentials)
+		result, err := a.qr.RefreshLoginBuffer(refreshCtx, creds)
+		cancel()
+		if err == nil {
+			_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, result.Credentials.ToMap())
+			_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
+			log.Printf("[autoRefresh] account %d (%s) refreshed OK (attempt %d)", acc.ID, acc.OpenID, attempt)
+			return
+		}
+		log.Printf("[autoRefresh] account %d (%s) refresh attempt %d failed: %v", acc.ID, acc.OpenID, attempt+1, err)
+		if attempt < maxRetries {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryDelay):
+			}
+		}
+	}
+	// All retries exhausted, mark expired
+	_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
+	log.Printf("[autoRefresh] account %d (%s) marked expired after %d retries", acc.ID, acc.OpenID, maxRetries)
 }
 
 func (a *App) Close() error {
