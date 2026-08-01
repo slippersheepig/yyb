@@ -109,6 +109,10 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// Start background auto-refresh for credential renewal.
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	go app.StartAutoRefresh(bgCtx)
+
 	go func() {
 		log.Printf("YYB Go service listening on http://%s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -119,6 +123,8 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
+
+	bgCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
