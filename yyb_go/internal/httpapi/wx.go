@@ -77,7 +77,7 @@ func (a *App) handleWxBind(w http.ResponseWriter, r *http.Request) {
 		GID      string `json:"gid"`
 	}
 	if err := decodeOptionalJSON(r, &body); err != nil || body.BindCode == "" || body.GID == "" {
-		writeJSON(w, http.StatusOK, map[string]string{"message": "请输入完整指令，格式：yyb 绑定 您的绑定码"})
+		writeRawJSON(w, http.StatusOK, map[string]string{"message": "请输入完整指令，格式：yyb 绑定 您的绑定码"})
 		return
 	}
 	body.BindCode = strings.TrimSpace(body.BindCode)
@@ -85,13 +85,13 @@ func (a *App) handleWxBind(w http.ResponseWriter, r *http.Request) {
 
 	accID, err := a.db.BindWxUser(r.Context(), body.BindCode, body.GID)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("绑定失败：%s", err.Error())})
+		writeRawJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("绑定失败：%s", err.Error())})
 		return
 	}
 	// Push a welcome message after successful bind
 	_, _ = a.db.PushWxMessage(r.Context(), accID, "bind_ok",
 		"✅ 绑定成功！从现在起，您扫码登录yyb后可在公众号发送「yyb 取件」获取登录状态、京东验证结果等提醒。")
-	writeJSON(w, http.StatusOK, map[string]string{"message": "✅ 绑定成功！后续登录状态、京东验证结果等消息可通过「yyb 取件」获取。"})
+	writeRawJSON(w, http.StatusOK, map[string]string{"message": "✅ 绑定成功！后续登录状态、京东验证结果等消息可通过「yyb 取件」获取。"})
 }
 
 // GET /api/wx/pending?gid=wx_abc123  (called by sillygirl plugin — no auth)
@@ -103,12 +103,12 @@ func (a *App) handleWxPending(w http.ResponseWriter, r *http.Request) {
 	}
 	gid := strings.TrimSpace(r.URL.Query().Get("gid"))
 	if gid == "" {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "error", "data": "缺少 gid 参数"})
+		writeRawJSON(w, http.StatusOK, map[string]string{"status": "error", "data": "缺少 gid 参数"})
 		return
 	}
 	acc, err := a.db.GetAccountByGzhOpenID(r.Context(), gid)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]string{
+		writeRawJSON(w, http.StatusOK, map[string]string{
 			"status": "idle",
 			"data":   "未找到绑定的YYB账号，请先在YYB网页端生成绑定码，然后在公众号发送「yyb 绑定 绑定码」",
 		})
@@ -116,11 +116,11 @@ func (a *App) handleWxPending(w http.ResponseWriter, r *http.Request) {
 	}
 	msgs, err := a.db.FetchPendingMessages(r.Context(), acc.ID)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "error", "data": "获取消息失败"})
+		writeRawJSON(w, http.StatusOK, map[string]string{"status": "error", "data": "获取消息失败"})
 		return
 	}
 	if len(msgs) == 0 {
-		writeJSON(w, http.StatusOK, map[string]string{
+		writeRawJSON(w, http.StatusOK, map[string]string{
 			"status": "idle",
 			"data":   "当前没有待取的消息。在YYB扫码登录或进行京东验证后会在这里显示。",
 		})
@@ -134,7 +134,7 @@ func (a *App) handleWxPending(w http.ResponseWriter, r *http.Request) {
 		b.WriteString(m.Content)
 	}
 	_ = a.db.MarkMessagesRead(r.Context(), acc.ID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "done", "data": b.String()})
+	writeRawJSON(w, http.StatusOK, map[string]string{"status": "done", "data": b.String()})
 }
 
 // POST /api/wx/push  (protected — API token or admin session)
