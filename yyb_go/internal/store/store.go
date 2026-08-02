@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS wechat_accounts (
     login_buffer    TEXT    NOT NULL,
     credentials     TEXT,
     status          TEXT,
+    jd_risk_url     TEXT,
     last_checked_at INTEGER,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
@@ -84,6 +86,7 @@ type WechatAccount struct {
 	LoginBuffer   string         `json:"login_buffer,omitempty"`
 	Credentials   map[string]any `json:"credentials,omitempty"`
 	Status        *string        `json:"status,omitempty"`
+	JdRiskURL     *string        `json:"jd_risk_url,omitempty"`
 	LastCheckedAt *int64         `json:"last_checked_at,omitempty"`
 	CreatedAt     int64          `json:"created_at"`
 	UpdatedAt     int64          `json:"updated_at"`
@@ -97,6 +100,7 @@ type AccountPublic struct {
 	Nickname      *string `json:"nickname"`
 	Avatar        *string `json:"avatar"`
 	Status        *string `json:"status"`
+	JdRiskURL     *string `json:"jd_risk_url,omitempty"`
 	LastCheckedAt *int64  `json:"last_checked_at"`
 	CreatedAt     int64   `json:"created_at"`
 	UpdatedAt     int64   `json:"updated_at"`
@@ -154,6 +158,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = migrateSessionsTable(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateJdRiskURLColumn(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -236,6 +244,27 @@ func (db *DB) EnsureDefaultFeatures(ctx context.Context) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// migrateJdRiskURLColumn adds the jd_risk_url column to existing wechat_accounts tables
+// that were created before this feature was introduced.
+func migrateJdRiskURLColumn(ctx context.Context, db *sql.DB) error {
+	// Check if the column already exists.
+	var colCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_table_info('wechat_accounts') WHERE name='jd_risk_url'`,
+	).Scan(&colCount); err != nil {
+		return fmt.Errorf("check jd_risk_url column: %w", err)
+	}
+	if colCount > 0 {
+		return nil // already migrated
+	}
+	_, err := db.ExecContext(ctx, `ALTER TABLE wechat_accounts ADD COLUMN jd_risk_url TEXT`)
+	if err != nil {
+		return fmt.Errorf("add jd_risk_url column: %w", err)
+	}
+	log.Printf("[migration] added jd_risk_url column to wechat_accounts")
 	return nil
 }
 
@@ -385,6 +414,16 @@ func (db *DB) SetAccountStatus(ctx context.Context, id int64, status string) err
 	return err
 }
 
+// SetJdRiskURL stores or clears the JD risk verification URL for an account.
+func (db *DB) SetJdRiskURL(ctx context.Context, id int64, riskURL string) error {
+	now := time.Now().Unix()
+	_, err := db.sql.ExecContext(ctx,
+		"UPDATE wechat_accounts SET jd_risk_url=?, updated_at=? WHERE id=?",
+		riskURL, now, id,
+	)
+	return err
+}
+
 func (db *DB) DeleteAccount(ctx context.Context, id int64) error {
 	_, err := db.sql.ExecContext(ctx, "DELETE FROM wechat_accounts WHERE id=?", id)
 	return err
@@ -495,13 +534,14 @@ func (a *WechatAccount) Public() AccountPublic {
 		Nickname:      a.Nickname,
 		Avatar:        a.Avatar,
 		Status:        a.Status,
+		JdRiskURL:     a.JdRiskURL,
 		LastCheckedAt: a.LastCheckedAt,
 		CreatedAt:     a.CreatedAt,
 		UpdatedAt:     a.UpdatedAt,
 	}
 }
 
-const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, last_checked_at, created_at, updated_at FROM wechat_accounts`
+const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, jd_risk_url, last_checked_at, created_at, updated_at FROM wechat_accounts`
 
 type accountScanner interface {
 	Scan(dest ...any) error
@@ -521,11 +561,11 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 		uin, lastChecked        sql.NullInt64
 		alias, nickname, avatar sql.NullString
 		userJSON, credJSON      sql.NullString
-		status                  sql.NullString
+		status, jdRiskURL       sql.NullString
 	)
 	err := row.Scan(
 		&a.ID, &a.OpenID, &uin, &alias, &nickname, &avatar, &userJSON,
-		&a.LoginBuffer, &credJSON, &status, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
+		&a.LoginBuffer, &credJSON, &status, &jdRiskURL, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -537,6 +577,7 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	a.Nickname = stringPtrFromNull(nickname)
 	a.Avatar = stringPtrFromNull(avatar)
 	a.Status = stringPtrFromNull(status)
+	a.JdRiskURL = stringPtrFromNull(jdRiskURL)
 	if lastChecked.Valid {
 		a.LastCheckedAt = &lastChecked.Int64
 	}
