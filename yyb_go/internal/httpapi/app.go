@@ -40,6 +40,7 @@ type Config struct {
 	WebUser        string
 	WebPass        string
 	WxGzhLink      string
+	WxGzhName      string
 }
 
 type App struct {
