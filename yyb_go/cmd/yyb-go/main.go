@@ -85,6 +85,7 @@ func main() {
 		WebUser:        os.Getenv("YYB_WEB_USER"),
 		WebPass:        os.Getenv("YYB_WEB_PASS"),
 		WxGzhLink:      getEnvDefault("YYB_WX_GZH_LINK", "https://d.sheepig.top/gzh"),
+		WxGzhName:      getEnvDefault("YYB_WX_GZH_NAME", "3DS电影"),
 	}
 
 	app, err := httpapi.NewApp(cfg)
