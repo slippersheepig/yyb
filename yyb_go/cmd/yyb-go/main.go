@@ -18,6 +18,13 @@ import (
 	"yyb_go/internal/tgbot"
 )
 
+func getEnvDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 func parseAllowedIPs(s string) []string {
     if s == "" {
         return nil
@@ -77,6 +84,7 @@ func main() {
 		TGAdminIDs:     parseAdminIDs(os.Getenv("TG_ADMIN_IDS")),
 		WebUser:        os.Getenv("YYB_WEB_USER"),
 		WebPass:        os.Getenv("YYB_WEB_PASS"),
+		WxGzhLink:      getEnvDefault("YYB_WX_GZH_LINK", "https://d.sheepig.top/gzh"),
 	}
 
 	app, err := httpapi.NewApp(cfg)
