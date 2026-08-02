@@ -279,20 +279,9 @@
 
     // ── 复制京东CK ──
     async function copyJdCk() {
-      // 如果内存里没有CK，尝试从API实时获取
       if (!_jdCk) {
-        try {
-          const ckResp = await api('GET', '/api/my/jd-cookie');
-          if (ckResp.jd_cookie) {
-            _jdCk = ckResp.jd_cookie;
-          } else {
-            showToast('请先点击「验证京东登录」', true);
-            return;
-          }
-        } catch (e) {
-          showToast('请先点击「验证京东登录」', true);
-          return;
-        }
+        showToast('请先点击「验证京东登录」', true);
+        return;
       }
       try {
         await navigator.clipboard.writeText(_jdCk);
