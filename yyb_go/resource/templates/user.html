@@ -88,6 +88,14 @@
     }
     .btn-ghost { background: #f0f0f0; color: #606266; }
     .btn-ghost:hover { background: #e8e8e8; }
+    .btn-jd {
+      background: linear-gradient(135deg, #e1251b 0%, #cf0a2c 100%);
+      color: #fff;
+      width: 100%;
+      margin-bottom: 12px;
+    }
+    .btn-jd:hover { opacity: 0.9; }
+    .btn-jd:disabled { opacity: 0.5; cursor: not-allowed; }
     .loading {
       text-align: center;
       padding: 40px 20px;
@@ -98,6 +106,39 @@
       padding: 32px 20px;
       color: #f56c6c;
     }
+    /* JD check result box */
+    .jd-result {
+      margin-top: 16px;
+      padding: 16px;
+      border-radius: 10px;
+      font-size: 14px;
+      display: none;
+    }
+    .jd-result.ok { background: #f0f9eb; border: 1px solid #c2e7b0; color: #67c23a; }
+    .jd-result.risk { background: #fdf6ec; border: 1px solid #f5dab1; color: #e6a23c; }
+    .jd-result.error { background: #fef0f0; border: 1px solid #fbc4c4; color: #f56c6c; }
+    .jd-result .jd-title { font-weight: 700; margin-bottom: 8px; }
+    .jd-result .jd-link {
+      display: block;
+      margin-top: 10px;
+      word-break: break-all;
+      color: #409eff;
+      text-decoration: none;
+      font-size: 12px;
+      font-family: monospace;
+    }
+    .jd-result .jd-link:hover { text-decoration: underline; }
+    .jd-spinner {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border: 2px solid #ddd;
+      border-top-color: #e1251b;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -106,8 +147,13 @@
   </div>
 
   <script>
-    async function api(method, url) {
-      const r = await fetch(url, { method });
+    async function api(method, url, body) {
+      const opts = { method };
+      if (body) {
+        opts.headers = { 'Content-Type': 'application/json' };
+        opts.body = JSON.stringify(body);
+      }
+      const r = await fetch(url, opts);
       const t = await r.text();
       let d; try { d = t ? JSON.parse(t) : null; } catch { d = t; }
       const isEnv = d && typeof d === 'object' && !Array.isArray(d)
@@ -137,6 +183,46 @@
       return `<span class="status-badge ${cls}"><span class="status-dot"></span>${text}</span>`;
     }
 
+    let jdChecking = false;
+
+    async function runJdCheck() {
+      if (jdChecking) return;
+      jdChecking = true;
+      const btn = $('jdBtn');
+      const result = $('jdResult');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="jd-spinner"></span>正在验证...';
+      result.style.display = 'none';
+      result.className = 'jd-result';
+      try {
+        const resp = await api('POST', '/api/my/jd-check');
+        if (resp.status === 'ok') {
+          result.className = 'jd-result ok';
+          result.style.display = 'block';
+          result.innerHTML = `<div class="jd-title">✅ ${escapeHTML(resp.message || '京东登录成功')}</div>` +
+            (resp.pt_pin ? `<div>账号：${escapeHTML(resp.pt_pin)}</div>` : '');
+        } else if (resp.status === 'risk') {
+          result.className = 'jd-result risk';
+          result.style.display = 'block';
+          result.innerHTML = `<div class="jd-title">⚠️ ${escapeHTML(resp.message || '需要风险认证')}</div>` +
+            `<div>请点击下方链接在浏览器中完成认证，完成后点击「重新验证」</div>` +
+            `<a class="jd-link" href="${escapeHTML(resp.risk_url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(resp.risk_url)}</a>`;
+        } else {
+          result.className = 'jd-result error';
+          result.style.display = 'block';
+          result.innerHTML = `<div class="jd-title">❌ ${escapeHTML(resp.message || '验证失败')}</div>`;
+        }
+      } catch (e) {
+        result.className = 'jd-result error';
+        result.style.display = 'block';
+        result.innerHTML = `<div class="jd-title">❌ 请求失败</div><div>${escapeHTML(e.message || '未知错误')}</div>`;
+      } finally {
+        jdChecking = false;
+        btn.disabled = false;
+        btn.textContent = '重新验证京东登录';
+      }
+    }
+
     async function loadMyStatus() {
       try {
         const resp = await api('GET', '/api/my/status');
@@ -144,6 +230,20 @@
         const acc = resp.account || resp;
         const card = $('userCard');
         const name = acc.nickname || acc.alias || '微信用户';
+
+        // Build JD risk banner if there's a persisted risk URL
+        let riskBanner = '';
+        if (acc.jd_risk_url) {
+          riskBanner = `
+            <div class="jd-result risk" id="jdResult" style="display:block">
+              <div class="jd-title">⚠️ 上次验证需要风险认证</div>
+              <div>请点击下方链接在浏览器中完成认证，完成后点击「重新验证」</div>
+              <a class="jd-link" href="${escapeHTML(acc.jd_risk_url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(acc.jd_risk_url)}</a>
+            </div>`;
+        } else {
+          riskBanner = `<div class="jd-result" id="jdResult"></div>`;
+        }
+
         card.innerHTML = `
           <div class="card-header">
             <div class="avatar">
@@ -175,8 +275,10 @@
               <span class="label">创建时间</span>
               <span class="value">${formatTime(acc.created_at)}</span>
             </div>
+            ${riskBanner}
           </div>
           <div class="card-footer">
+            <button class="btn btn-jd" id="jdBtn" onclick="runJdCheck()">验证京东登录</button>
             <a class="btn btn-ghost" href="/scan">重新扫码</a>
           </div>
         `;
