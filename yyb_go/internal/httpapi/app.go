@@ -232,6 +232,7 @@ func (a *App) Handler() http.Handler {
     userGroup.Any("/my", gin.WrapF(a.handleMy))
     userGroup.Any("/api/my/status", gin.WrapF(a.handleMyStatus))
     userGroup.Any("/api/my/avatar", gin.WrapF(a.handleMyAvatar))
+    userGroup.Any("/api/my/jd-check", gin.WrapF(a.handleMyJdCheck))
 
     // ── 受保护路由（需要鉴权）──
     protected := router.Group("", a.authMiddleware())
