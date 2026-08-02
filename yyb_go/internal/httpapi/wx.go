@@ -32,7 +32,7 @@ func (a *App) handleWxBindCode(w http.ResponseWriter, r *http.Request) {
 		"bind_code": code,
 		"bound":     gzhOpenID != nil,
 		"gzh_link":  a.cfg.WxGzhLink,
-		"gzh_name":  "3DS电影",
+		"gzh_name":  a.cfg.WxGzhName,
 	})
 }
 
@@ -51,7 +51,7 @@ func (a *App) handleWxBindStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"bound":    false,
 			"gzh_link": a.cfg.WxGzhLink,
-			"gzh_name": "3DS电影",
+			"gzh_name": a.cfg.WxGzhName,
 		})
 		return
 	}
@@ -59,7 +59,7 @@ func (a *App) handleWxBindStatus(w http.ResponseWriter, r *http.Request) {
 		"bound":      gzhOpenID != nil,
 		"bind_code":  code,
 		"gzh_link":   a.cfg.WxGzhLink,
-		"gzh_name":   "3DS电影",
+		"gzh_name":   a.cfg.WxGzhName,
 		"gzh_openid": gzhOpenID,
 	})
 }
