@@ -281,6 +281,10 @@
             <button class="btn btn-jd" id="jdBtn" onclick="runJdCheck()">验证京东登录</button>
             <a class="btn btn-ghost" href="/scan">重新扫码</a>
           </div>
+          <div id="wxBindSection" style="padding:20px 32px;border-top:1px solid #ebeef5">
+            <div style="font-size:15px;font-weight:600;margin-bottom:12px;color #303133">📱 微信通知绑定</div>
+            <div id="wxBindContent" style="font-size:13px;color:#606266">加载中…</div>
+          </div>
         `;
       } catch (e) {
         $('userCard').innerHTML = `
@@ -295,6 +299,72 @@
 
     function $(id) { return document.getElementById(id); }
     loadMyStatus();
+
+    // ── 微信通知绑定 ──
+    async function loadWxBindStatus() {
+      try {
+        const resp = await api('POST', '/api/wx/bind-status');
+        const el = $('wxBindContent');
+        if (!el) return;
+        if (resp.bound) {
+          el.innerHTML = `
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="color:#67c23a;font-size:16px">✅</span>
+              <span>已绑定微信公众号「${escapeHTML(resp.gzh_name || '3DS电影')}」</span>
+            </div>
+            <div style="margin-top:8px;color:#909399;font-size:12px">在公众号发送「yyb 取件」可获取登录状态和京东验证结果通知</div>
+          `;
+        } else {
+          el.innerHTML = `
+            <div style="margin-bottom:12px;color:#606266">绑定后可在公众号接收登录状态和京东验证结果通知</div>
+            <div id="wxBindCodeArea" style="margin-bottom:16px"></div>
+            <div id="wxQrArea" style="text-align:center"></div>
+            <button class="btn btn-ghost" id="wxGenBtn" onclick="genBindCode()" style="margin-top:12px;width:100%">生成绑定码</button>
+          `;
+          if (resp.bind_code) {
+            showBindCode(resp.bind_code, resp.gzh_link);
+          }
+        }
+      } catch (e) {
+        const el = $('wxBindContent');
+        if (el) el.innerHTML = '<span style="color:#909399">绑定信息加载失败</span>';
+      }
+    }
+
+    async function genBindCode() {
+      const btn = $('wxGenBtn');
+      if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
+      try {
+        const resp = await api('POST', '/api/wx/bind-code');
+        showBindCode(resp.bind_code, resp.gzh_link);
+      } catch (e) {
+        if (btn) { btn.disabled = false; btn.textContent = '生成绑定码'; }
+        alert('生成失败：' + (e.message || '未知错误'));
+      }
+    }
+
+    function showBindCode(code, gzhLink) {
+      const codeArea = $('wxBindCodeArea');
+      const qrArea = $('wxQrArea');
+      const btn = $('wxGenBtn');
+      if (btn) { btn.disabled = false; btn.textContent = '重新生成'; }
+      if (codeArea) {
+        codeArea.innerHTML = `
+          <div style="font-size:12px;color:#909399;margin-bottom:6px">您的绑定码：</div>
+          <div style="font-size:28px;font-weight:700;letter-spacing:6px;color:#409eff;text-align:center;padding:8px 0">${escapeHTML(code)}</div>
+          <div style="font-size:12px;color:#909399;text-align:center">在公众号发送「yyb 绑定 ${escapeHTML(code)}」完成绑定</div>
+        `;
+      }
+      if (qrArea && gzhLink) {
+        qrArea.innerHTML = `
+          <div style="font-size:12px;color:#909399;margin-bottom:8px">扫码关注公众号「3DS电影」</div>
+          <img src="${escapeHTML(gzhLink)}" alt="公众号二维码" style="max-width:160px;border-radius:8px;border:1px solid #ebeef5" onerror="this.style.display='none'">
+        `;
+      }
+    }
+
+    // Delay loading bind status until card is rendered
+    setTimeout(loadWxBindStatus, 500);
   </script>
 </body>
 </html>
