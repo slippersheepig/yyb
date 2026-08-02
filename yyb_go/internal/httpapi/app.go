@@ -39,6 +39,7 @@ type Config struct {
 	TGAdminIDs     []int64
 	WebUser        string
 	WebPass        string
+	WxGzhLink      string // WeChat Official Account follow link
 }
 
 type App struct {
@@ -233,6 +234,12 @@ func (a *App) Handler() http.Handler {
     userGroup.Any("/api/my/status", gin.WrapF(a.handleMyStatus))
     userGroup.Any("/api/my/avatar", gin.WrapF(a.handleMyAvatar))
     userGroup.Any("/api/my/jd-check", gin.WrapF(a.handleMyJdCheck))
+    userGroup.Any("/api/wx/bind-code", gin.WrapF(a.handleWxBindCode))
+    userGroup.Any("/api/wx/bind-status", gin.WrapF(a.handleWxBindStatus))
+
+    // ── 公开的微信绑定/取件路由（傻妞插件调用，无需鉴权）──
+    router.Any("/api/wx/bind", gin.WrapF(a.handleWxBind))
+    router.Any("/api/wx/pending", gin.WrapF(a.handleWxPending))
 
     // ── 受保护路由（需要鉴权）──
     protected := router.Group("", a.authMiddleware())
@@ -248,6 +255,7 @@ func (a *App) Handler() http.Handler {
     protected.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
     protected.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
     protected.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
+    protected.Any("/api/wx/push", gin.WrapF(a.handleWxPush))
 
     router.NoRoute(func(c *gin.Context) {
         writeError(c.Writer, http.StatusNotFound, "not found")
