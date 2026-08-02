@@ -325,6 +325,12 @@
           riskBanner = `<div class="jd-result" id="jdResult"></div>`;
         }
 
+        // 如果DB里已有CK，预加载到内存并标记需要显示按钮
+        if (acc.jd_cookie) {
+          _jdCk = acc.jd_cookie;
+        }
+        const showCopyBtn = _jdCk ? ' style="display:inline-block"' : '';
+
         card.innerHTML = `
           <div class="card-header">
             <div class="avatar">
@@ -360,7 +366,7 @@
           </div>
           <div class="card-footer">
             <button class="btn btn-jd" id="jdBtn" onclick="runJdCheck()">验证京东登录</button>
-            <button class="btn btn-copy-ck" id="copyCkBtn" onclick="copyJdCk()">📋 复制京东CK</button>
+            <button class="btn btn-copy-ck" id="copyCkBtn" onclick="copyJdCk()"${showCopyBtn}>📋 复制京东CK</button>
             <a class="btn btn-ghost" href="/scan">重新扫码</a>
             ${resp.is_admin ? '<a class="btn btn-ghost" href="/admin" style="margin-top:8px">管理后台</a>' : ''}
           </div>
