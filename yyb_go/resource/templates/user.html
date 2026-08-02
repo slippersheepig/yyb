@@ -226,7 +226,7 @@
     async function loadMyStatus() {
       try {
         const resp = await api('GET', '/api/my/status');
-        if (resp.is_admin) { location.href = '/admin'; return; }
+        if (resp.is_admin && !resp.account) { location.href = '/admin'; return; }
         const acc = resp.account || resp;
         const card = $('userCard');
         const name = acc.nickname || acc.alias || '微信用户';
@@ -280,6 +280,7 @@
           <div class="card-footer">
             <button class="btn btn-jd" id="jdBtn" onclick="runJdCheck()">验证京东登录</button>
             <a class="btn btn-ghost" href="/scan">重新扫码</a>
+            ${resp.is_admin ? '<a class="btn btn-ghost" href="/admin" style="margin-top:8px">管理后台</a>' : ''}
           </div>
           <div id="wxBindSection" style="padding:20px 32px;border-top:1px solid #ebeef5">
             <div style="font-size:15px;font-weight:600;margin-bottom:12px;color #303133">📱 微信通知绑定</div>
