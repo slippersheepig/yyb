@@ -251,9 +251,10 @@
           // 验证成功，持有CK并显示复制按钮
           if (resp.jd_cookie) {
             _jdCk = resp.jd_cookie;
-            const copyBtn = $('copyCkBtn');
-            if (copyBtn) copyBtn.style.display = 'inline-block';
           }
+          // 无条件显示按钮：即使jd_cookie被omitempty吞掉也能显示
+          const copyBtn = $('copyCkBtn');
+          if (copyBtn) copyBtn.style.display = 'inline-block';
         } else if (resp.status === 'risk') {
           result.className = 'jd-result risk';
           result.style.display = 'block';
@@ -278,9 +279,20 @@
 
     // ── 复制京东CK ──
     async function copyJdCk() {
+      // 如果内存里没有CK，尝试从API实时获取
       if (!_jdCk) {
-        showToast('请先点击「验证京东登录」', true);
-        return;
+        try {
+          const ckResp = await api('GET', '/api/my/jd-cookie');
+          if (ckResp.jd_cookie) {
+            _jdCk = ckResp.jd_cookie;
+          } else {
+            showToast('请先点击「验证京东登录」', true);
+            return;
+          }
+        } catch (e) {
+          showToast('请先点击「验证京东登录」', true);
+          return;
+        }
       }
       try {
         await navigator.clipboard.writeText(_jdCk);
@@ -409,9 +421,8 @@
             <div id="wxQrArea" style="text-align:center"></div>
             <button class="btn btn-ghost" id="wxGenBtn" onclick="genBindCode()" style="margin-top:12px;width:100%">生成绑定码</button>
           `;
-          if (resp.bind_code) {
-            showBindCode(resp.bind_code, resp.gzh_link);
-          }
+          // 无论有没有bind_code，都显示公众号二维码
+          showBindCode(resp.bind_code || '', resp.gzh_link);
         }
       } catch (e) {
         const el = $('wxBindContent');
@@ -436,13 +447,15 @@
       const qrArea = $('wxQrArea');
       const btn = $('wxGenBtn');
       if (btn) { btn.disabled = false; btn.textContent = '重新生成'; }
-      if (codeArea) {
+      // 有绑定码时才显示绑定码区域
+      if (codeArea && code) {
         codeArea.innerHTML = `
           <div style="font-size:12px;color:#909399;margin-bottom:6px">您的绑定码：</div>
           <div style="font-size:28px;font-weight:700;letter-spacing:6px;color:#409eff;text-align:center;padding:8px 0">${escapeHTML(code)}</div>
           <div style="font-size:12px;color:#909399;text-align:center">在公众号发送「yyb 绑定 ${escapeHTML(code)}」完成绑定</div>
         `;
       }
+      // 始终显示公众号二维码
       if (qrArea && gzhLink) {
         qrArea.innerHTML = `
           <div style="font-size:12px;color:#909399;margin-bottom:8px" id="wxQrLabel">扫码关注公众号</div>
