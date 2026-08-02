@@ -96,6 +96,15 @@
     }
     .btn-jd:hover { opacity: 0.9; }
     .btn-jd:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-copy-ck {
+      background: linear-gradient(135deg, #1aad19 0%, #0e8c0e 100%);
+      color: #fff;
+      width: 100%;
+      margin-bottom: 12px;
+      display: none;
+    }
+    .btn-copy-ck:hover { opacity: 0.9; }
+    .btn-copy-ck:disabled { opacity: 0.5; cursor: not-allowed; }
     .loading {
       text-align: center;
       padding: 40px 20px;
@@ -139,14 +148,68 @@
       margin-right: 6px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    /* Toast */
+    .toast {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-100px);
+      background: #1aad19;
+      color: #fff;
+      padding: 12px 28px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+      z-index: 9999;
+      transition: transform 0.3s ease, opacity 0.3s ease;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+    .toast.error { background: #f56c6c; }
   </style>
 </head>
 <body>
   <div class="user-card" id="userCard">
     <div class="loading" id="loadingBox">正在加载账号信息…</div>
   </div>
+  <div class="toast" id="toast"></div>
 
   <script>
+    // ── 当前验证产生的京东CK（仅内存，不持久化到前端存储）──
+    let _jdCk = '';
+
+    function $(id) { return document.getElementById(id); }
+
+    function escapeHTML(v) {
+      return String(v ?? '').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/"/g,'"');
+    }
+
+    function formatTime(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts * 1000);
+      const p = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
+    function statusBadge(status) {
+      const cls = status === 'alive' ? 'alive' : status === 'expired' ? 'expired' : 'unknown';
+      const text = status === 'alive' ? '可用' : status === 'expired' ? '需重扫' : '待确认';
+      return `<span class="status-badge ${cls}"><span class="status-dot"></span>${text}</span>`;
+    }
+
+    function showToast(msg, isError) {
+      const t = $('toast');
+      if (!t) return;
+      t.textContent = msg;
+      t.className = 'toast show' + (isError ? ' error' : '');
+      setTimeout(() => { t.className = 'toast' + (isError ? ' error' : ''); }, 2000);
+    }
+
     async function api(method, url, body) {
       const opts = { method };
       if (body) {
@@ -166,23 +229,7 @@
       return isEnv ? d.data : d;
     }
 
-    function escapeHTML(v) {
-      return String(v ?? '').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/"/g,'"');
-    }
-
-    function formatTime(ts) {
-      if (!ts) return '—';
-      const d = new Date(ts * 1000);
-      const p = n => String(n).padStart(2, '0');
-      return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-    }
-
-    function statusBadge(status) {
-      const cls = status === 'alive' ? 'alive' : status === 'expired' ? 'expired' : 'unknown';
-      const text = status === 'alive' ? '可用' : status === 'expired' ? '需重扫' : '待确认';
-      return `<span class="status-badge ${cls}"><span class="status-dot"></span>${text}</span>`;
-    }
-
+    // ── 京东验证 ──
     let jdChecking = false;
 
     async function runJdCheck() {
@@ -201,6 +248,12 @@
           result.style.display = 'block';
           result.innerHTML = `<div class="jd-title">✅ ${escapeHTML(resp.message || '京东登录成功')}</div>` +
             (resp.pt_pin ? `<div>账号：${escapeHTML(resp.pt_pin)}</div>` : '');
+          // 验证成功，持有CK并显示复制按钮
+          if (resp.jd_cookie) {
+            _jdCk = resp.jd_cookie;
+            const copyBtn = $('copyCkBtn');
+            if (copyBtn) copyBtn.style.display = 'inline-block';
+          }
         } else if (resp.status === 'risk') {
           result.className = 'jd-result risk';
           result.style.display = 'block';
@@ -223,6 +276,34 @@
       }
     }
 
+    // ── 复制京东CK ──
+    async function copyJdCk() {
+      if (!_jdCk) {
+        showToast('请先点击「验证京东登录」', true);
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(_jdCk);
+        showToast('✅ 京东CK已复制到剪贴板');
+      } catch (e) {
+        // Fallback for non-HTTPS or older browsers
+        const ta = document.createElement('textarea');
+        ta.value = _jdCk;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand('copy');
+          showToast('✅ 京东CK已复制到剪贴板');
+        } catch (e2) {
+          showToast('复制失败，请手动复制', true);
+        }
+        document.body.removeChild(ta);
+      }
+    }
+
+    // ── 加载账号信息 ──
     async function loadMyStatus() {
       try {
         const resp = await api('GET', '/api/my/status');
@@ -279,11 +360,12 @@
           </div>
           <div class="card-footer">
             <button class="btn btn-jd" id="jdBtn" onclick="runJdCheck()">验证京东登录</button>
+            <button class="btn btn-copy-ck" id="copyCkBtn" onclick="copyJdCk()">📋 复制京东CK</button>
             <a class="btn btn-ghost" href="/scan">重新扫码</a>
             ${resp.is_admin ? '<a class="btn btn-ghost" href="/admin" style="margin-top:8px">管理后台</a>' : ''}
           </div>
           <div id="wxBindSection" style="padding:20px 32px;border-top:1px solid #ebeef5">
-            <div style="font-size:15px;font-weight:600;margin-bottom:12px;color #303133">📱 微信通知绑定</div>
+            <div style="font-size:15px;font-weight:600;margin-bottom:12px;color:#303133">📱 微信通知绑定</div>
             <div id="wxBindContent" style="font-size:13px;color:#606266">加载中…</div>
           </div>
         `;
@@ -298,7 +380,6 @@
       }
     }
 
-    function $(id) { return document.getElementById(id); }
     loadMyStatus();
 
     // ── 微信通知绑定 ──
