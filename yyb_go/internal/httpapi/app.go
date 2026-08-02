@@ -235,6 +235,7 @@ func (a *App) Handler() http.Handler {
     userGroup.Any("/api/my/status", gin.WrapF(a.handleMyStatus))
     userGroup.Any("/api/my/avatar", gin.WrapF(a.handleMyAvatar))
     userGroup.Any("/api/my/jd-check", gin.WrapF(a.handleMyJdCheck))
+    userGroup.Any("/api/my/jd-cookie", gin.WrapF(a.handleMyJdCookie))
     userGroup.Any("/api/wx/bind-code", gin.WrapF(a.handleWxBindCode))
     userGroup.Any("/api/wx/bind-status", gin.WrapF(a.handleWxBindStatus))
 
