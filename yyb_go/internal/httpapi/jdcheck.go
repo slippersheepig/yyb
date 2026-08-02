@@ -77,7 +77,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	if riskURL != "" {
 		result.Status = "risk"
 		result.RiskURL = riskURL
-		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新扫码"
+		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证"
 		_ = a.db.SetJdRiskURL(ctx, acc.ID, riskURL)
 		return result, nil
 	}
@@ -281,7 +281,7 @@ func searchRawBodyForRiskUrl(rawBody string) string {
 	return ""
 }
 
-func normaliseJDURL(raw string) string {
+func normaliseJDUrl(raw string) string {
 	if strings.HasPrefix(raw, "//") {
 		return "https:" + raw
 	}
