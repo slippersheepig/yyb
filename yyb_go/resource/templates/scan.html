@@ -76,9 +76,10 @@
       else if(st.status==='cancelled'){stopTimers();setStatus('已取消，请重新生成二维码','s-err');$('countdown').textContent=''}
     }
     async function confirm(){
+      const confirmSid=sid;sid=null;  // 立即清空 sid，阻止残留 poll 请求
       $('countdown').textContent='';setStatus('授权成功，正在入库...','s-ok');
       try{
-        const resp=await api('POST',`/qr/${sid}/confirm`);
+        const resp=await api('POST',`/qr/${confirmSid}/confirm`);
         const acc=resp.account||resp;
         const redirect=resp.redirect||'/my';
         setStatus('✓ 登录成功','s-ok');
