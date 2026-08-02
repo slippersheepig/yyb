@@ -19,12 +19,13 @@ import (
 
 // JDCheckResult is the JSON response for POST /api/my/jd-check.
 type JDCheckResult struct {
-	Status  string `json:"status"`             // "ok" | "risk" | "error"
-	Message string `json:"message,omitempty"`   // human-readable summary
-	RiskURL string `json:"risk_url,omitempty"`  // ACRJUrl if risk verification needed
-	PTKey   string `json:"pt_key,omitempty"`    // pt_key if login succeeded
-	Pin     string `json:"pt_pin,omitempty"`    // pt_pin if login succeeded
-	Raw     string `json:"raw,omitempty"`       // truncated raw JD response for debugging
+	Status   string `json:"status"`              // "ok" | "risk" | "error"
+	Message  string `json:"message,omitempty"`   // human-readable summary
+	RiskURL  string `json:"risk_url,omitempty"`  // ACRJUrl if risk verification needed
+	PTKey    string `json:"pt_key,omitempty"`    // pt_key if login succeeded
+	Pin      string `json:"pt_pin,omitempty"`    // pt_pin if login succeeded
+	JdCookie string `json:"jd_cookie,omitempty"` // assembled cookie string: pt_key=xxx;pt_pin=xxx;
+	Raw      string `json:"raw,omitempty"`      // truncated raw JD response for debugging
 }
 
 // ── Constants (aligned with JDCode.py) ──
@@ -95,6 +96,12 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 					result.Pin = c2.Value
 				}
 			}
+			// Assemble the JD cookie string for easy copy
+			if result.PTKey != "" {
+				result.JdCookie = "pt_key=" + result.PTKey + ";pt_pin=" + result.Pin + ";"
+				// Persist CK to DB so user can retrieve it later without re-running check
+				_ = a.db.SetJdCookie(ctx, acc.ID, result.JdCookie)
+			}
 			_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 			return result, nil
 		}
@@ -110,6 +117,19 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	if strings.Contains(strings.ToUpper(retMsg), "SUCCESS") {
 		result.Status = "ok"
 		result.Message = "京东登录成功"
+		// Try to assemble CK from any cookies we captured even in this branch
+		for _, c := range cookies {
+			if c.Name == "pt_key" && c.Value != "" {
+				result.PTKey = c.Value
+			}
+			if (c.Name == "pt_pin" || c.Name == "pin") && c.Value != "" {
+				result.Pin = c.Value
+			}
+		}
+		if result.PTKey != "" {
+			result.JdCookie = "pt_key=" + result.PTKey + ";pt_pin=" + result.Pin + ";"
+			_ = a.db.SetJdCookie(ctx, acc.ID, result.JdCookie)
+		}
 		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 		return result, nil
 	}
@@ -343,6 +363,40 @@ func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 	// Push notification to wx message pool
 	a.pushWxNotification(acc.ID, "jd_check", result.Message)
 	writeJSON(w, http.StatusOK, result)
+}
+
+// ── handleMyJdCookie ──
+
+// handleMyJdCookie returns the stored JD cookie for the logged-in user.
+// GET /api/my/jd-cookie
+func (a *App) handleMyJdCookie(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	token, _ := getCookie(r, "yyb_user")
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	sess, err := a.db.GetUserSession(r.Context(), token)
+	if err != nil || sess == nil {
+		writeError(w, http.StatusUnauthorized, "会话已过期")
+		return
+	}
+	acc, err := a.db.GetAccount(r.Context(), sess.WechatAccountID)
+	if err != nil || acc == nil {
+		writeError(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	ck := ""
+	if acc.JdCookie != nil {
+		ck = *acc.JdCookie
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"jd_cookie":  ck,
+		"has_cookie": ck != "",
+	})
 }
 
 // ── helpers ──
