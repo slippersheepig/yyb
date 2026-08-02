@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -63,6 +64,28 @@ CREATE TABLE IF NOT EXISTS features (
     description TEXT,
     enabled     INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS wx_bindings (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    wechat_account_id INTEGER NOT NULL REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    bind_code         TEXT    NOT NULL UNIQUE,
+    gzh_openid        TEXT,
+    created_at        INTEGER NOT NULL,
+    bound_at          INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_wxbind_code ON wx_bindings(bind_code);
+CREATE INDEX IF NOT EXISTS idx_wxbind_uid ON wx_bindings(gzh_openid);
+CREATE INDEX IF NOT EXISTS idx_wxbind_acc ON wx_bindings(wechat_account_id);
+
+CREATE TABLE IF NOT EXISTS wx_messages (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    wechat_account_id INTEGER NOT NULL REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    msg_type          TEXT    NOT NULL,
+    content           TEXT    NOT NULL,
+    is_read           INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wxmsg_acc ON wx_messages(wechat_account_id, is_read);
 `
 
 var defaultFeatures = []Feature{
@@ -129,6 +152,24 @@ type UserSession struct {
 	WechatAccountID int64  `json:"wechat_account_id"`
 	CreatedAt       int64  `json:"created_at"`
 	ExpiresAt       int64  `json:"expires_at"`
+}
+
+type WxBinding struct {
+	ID              int64   `json:"id"`
+	WechatAccountID int64   `json:"wechat_account_id"`
+	BindCode        string  `json:"bind_code"`
+	GzhOpenID       *string `json:"gzh_openid,omitempty"`
+	CreatedAt       int64   `json:"created_at"`
+	BoundAt         *int64  `json:"bound_at,omitempty"`
+}
+
+type WxMessage struct {
+	ID              int64  `json:"id"`
+	WechatAccountID int64  `json:"wechat_account_id"`
+	MsgType         string `json:"msg_type"`
+	Content         string `json:"content"`
+	IsRead          bool   `json:"is_read"`
+	CreatedAt       int64  `json:"created_at"`
 }
 
 func Open(path string) (*DB, error) {
@@ -662,4 +703,135 @@ func isDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// CreateBindCode generates a unique 6-digit numeric bind code for a yyb account.
+// If an unbound code already exists for this account, it reuses it.
+func (db *DB) CreateBindCode(ctx context.Context, accountID int64) (string, error) {
+	var existing sql.NullString
+	err := db.sql.QueryRowContext(ctx,
+		"SELECT bind_code FROM wx_bindings WHERE wechat_account_id=? AND gzh_openid IS NULL ORDER BY created_at DESC LIMIT 1",
+		accountID,
+	).Scan(&existing)
+	if err == nil && existing.Valid {
+		return existing.String, nil
+	}
+	for i := 0; i < 10; i++ {
+		code := randomBindCode()
+		_, err := db.sql.ExecContext(ctx,
+			"INSERT INTO wx_bindings(wechat_account_id, bind_code, created_at) VALUES(?,?,?)",
+			accountID, code, time.Now().Unix(),
+		)
+		if err == nil {
+			return code, nil
+		}
+		// Retry on duplicate (SQLite constraint code 19).
+		var sqliteErr interface{ ErrorCode() int }
+		if errors.As(err, &sqliteErr) && sqliteErr.ErrorCode() == 19 {
+			continue
+		}
+		return "", err
+	}
+	return "", fmt.Errorf("failed to generate unique bind code")
+}
+
+// BindWxUser binds a gzh openid to a yyb account via bind code.
+func (db *DB) BindWxUser(ctx context.Context, bindCode, gzhOpenID string) (int64, error) {
+	res, err := db.sql.ExecContext(ctx,
+		"UPDATE wx_bindings SET gzh_openid=?, bound_at=? WHERE bind_code=? AND gzh_openid IS NULL",
+		gzhOpenID, time.Now().Unix(), bindCode,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return 0, fmt.Errorf("无效的绑定码或已绑定")
+	}
+	var accID int64
+	err = db.sql.QueryRowContext(ctx,
+		"SELECT wechat_account_id FROM wx_bindings WHERE bind_code=?", bindCode,
+	).Scan(&accID)
+	return accID, err
+}
+
+// GetAccountByGzhOpenID looks up a yyb account by gzh openid.
+func (db *DB) GetAccountByGzhOpenID(ctx context.Context, gzhOpenID string) (*WechatAccount, error) {
+	row := db.sql.QueryRowContext(ctx,
+		selectAccountSQL+` WHERE id=(SELECT wechat_account_id FROM wx_bindings WHERE gzh_openid=? ORDER BY bound_at DESC LIMIT 1)`,
+		gzhOpenID,
+	)
+	return db.scanAccount(row)
+}
+
+// GetBindCodeStatus returns the latest bind code for an account and whether it is bound.
+func (db *DB) GetBindCodeStatus(ctx context.Context, accountID int64) (bindCode string, gzhOpenID *string, err error) {
+	row := db.sql.QueryRowContext(ctx,
+		"SELECT bind_code, gzh_openid FROM wx_bindings WHERE wechat_account_id=? ORDER BY created_at DESC LIMIT 1",
+		accountID,
+	)
+	var gzh sql.NullString
+	if err := row.Scan(&bindCode, &gzh); err != nil {
+		return "", nil, err
+	}
+	if gzh.Valid {
+		gzhOpenID = &gzh.String
+	}
+	return bindCode, gzhOpenID, nil
+}
+
+// PushWxMessage adds a message to the wx_messages pool.
+func (db *DB) PushWxMessage(ctx context.Context, accountID int64, msgType, content string) (*WxMessage, error) {
+	res, err := db.sql.ExecContext(ctx,
+		"INSERT INTO wx_messages(wechat_account_id, msg_type, content, is_read, created_at) VALUES(?,?,?,0,?)",
+		accountID, msgType, content, time.Now().Unix(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &WxMessage{
+		ID: id, WechatAccountID: accountID, MsgType: msgType,
+		Content: content, CreatedAt: time.Now().Unix(),
+	}, nil
+}
+
+// FetchPendingMessages returns all unread messages for an account.
+func (db *DB) FetchPendingMessages(ctx context.Context, accountID int64) ([]WxMessage, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		"SELECT id, wechat_account_id, msg_type, content, is_read, created_at FROM wx_messages WHERE wechat_account_id=? AND is_read=0 ORDER BY id ASC",
+		accountID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WxMessage
+	for rows.Next() {
+		var m WxMessage
+		var isRead int64
+		if err := rows.Scan(&m.ID, &m.WechatAccountID, &m.MsgType, &m.Content, &isRead, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		m.IsRead = isRead != 0
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// MarkMessagesRead marks all unread messages for an account as read.
+func (db *DB) MarkMessagesRead(ctx context.Context, accountID int64) error {
+	_, err := db.sql.ExecContext(ctx,
+		"UPDATE wx_messages SET is_read=1 WHERE wechat_account_id=? AND is_read=0",
+		accountID,
+	)
+	return err
+}
+
+func randomBindCode() string {
+	n, err := rand.Int(rand.Reader, big.NewInt(900000))
+	if err != nil {
+		return fmt.Sprintf("%06d", time.Now().UnixNano()%900000+100000)
+	}
+	return fmt.Sprintf("%06d", n.Int64()+100000)
 }
