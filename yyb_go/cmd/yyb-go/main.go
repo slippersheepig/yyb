@@ -84,7 +84,7 @@ func main() {
 		TGAdminIDs:     parseAdminIDs(os.Getenv("TG_ADMIN_IDS")),
 		WebUser:        os.Getenv("YYB_WEB_USER"),
 		WebPass:        os.Getenv("YYB_WEB_PASS"),
-		WxGzhLink:      getEnvDefault("YYB_WX_GZH_LINK", "https://d.sheepig.top/gzh"),
+		WxGzhLink:      getEnvDefault("YYB_WX_GZH_LINK", "https://t.sheepig.top/images/2024/03/06/gzh.png"),
 		WxGzhName:      getEnvDefault("YYB_WX_GZH_NAME", "3DS电影"),
 	}
 
