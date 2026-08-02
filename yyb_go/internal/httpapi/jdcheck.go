@@ -109,7 +109,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	if errMsg != "" {
 		result.Message = "京东登录失败: " + errMsg
 	} else {
-		result.Message = "京东返回了未知响应"
+		result.Message = "京东返回了未知响应，既没有 pt_key 也没有二次验证链接"
 	}
 	return result, fmt.Errorf("unknown JD response: retCode=%v retMsg=%s",
 		jdResp["retCode"], errMsg)
@@ -189,12 +189,12 @@ func callLoginLt(ctx context.Context, code string) (map[string]any, []*http.Cook
 	return jdResp, cookies, rawBody, nil
 }
 
-// ── extractACRiskUrl ──
+// ── extractACRJUrl ──
 
-// extractACRiskUrl locates the A / risk verification URL in a JD login_lt
+// extractACRJUrl locates the A / risk verification URL in a JD login_lt
 // response, using the same strategy as JDCode.py's login_info +
 // follow_server_refresh.
-func extractACRiskUrl(jdResp map[string]any, rawBody string) string {
+func extractACRJUrl(jdResp map[string]any, rawBody string) string {
 	if jdResp == nil {
 		return ""
 	}
