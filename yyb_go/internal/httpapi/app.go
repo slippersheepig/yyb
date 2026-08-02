@@ -39,7 +39,7 @@ type Config struct {
 	TGAdminIDs     []int64
 	WebUser        string
 	WebPass        string
-	WxGzhLink      string // WeChat Official Account follow link
+	WxGzhLink      string
 }
 
 type App struct {
@@ -237,7 +237,7 @@ func (a *App) Handler() http.Handler {
     userGroup.Any("/api/wx/bind-code", gin.WrapF(a.handleWxBindCode))
     userGroup.Any("/api/wx/bind-status", gin.WrapF(a.handleWxBindStatus))
 
-    // ── 公开的微信绑定/取件路由（傻妞插件调用，无需鉴权）──
+    // ── 公开的微信绑定/取件路由──
     router.Any("/api/wx/bind", gin.WrapF(a.handleWxBind))
     router.Any("/api/wx/pending", gin.WrapF(a.handleWxPending))
 
