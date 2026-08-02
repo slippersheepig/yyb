@@ -84,12 +84,14 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	}
 
 	// Step 4: Check for successful login via cookies (matching JDCode.py).
-	for _, c := range cookies {
+	// Merge jar cookies AND response cookies to handle 302 Set-Cookie correctly.
+	allCookies := append(cookies, resp.Cookies()...)
+	for _, c := range allCookies {
 		if c.Name == "pt_key" && c.Value != "" {
 			result.Status = "ok"
 			result.PTKey = c.Value
 			result.Message = "京东登录成功"
-			for _, c2 := range cookies {
+			for _, c2 := range allCookies {
 				if c2.Name == "pt_pin" || c2.Name == "pin" {
 					result.Pin = c2.Value
 				}
@@ -100,20 +102,26 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	}
 
 	// Neither risk URL nor pt_key cookie — unknown state.
-	// Also check retCode / retMsg / msg / errmsg for error messages.
-	errMsg := firstNonEmpty(
+	// Check retMsg: if it contains "SUCCESS", treat as ok (cookie not captured but login succeeded).
+	retMsg := firstNonEmpty(
 		strVal(jdResp, "retMsg"), strVal(jdResp, "retmsg"),
 		strVal(jdResp, "msg"), strVal(jdResp, "message"),
 		strVal(jdResp, "errmsg"), strVal(jdResp, "errMsg"),
 	)
+	if strings.Contains(strings.ToUpper(retMsg), "SUCCESS") {
+		result.Status = "ok"
+		result.Message = "京东登录成功"
+		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		return result, nil
+	}
 	result.Status = "error"
-	if errMsg != "" {
-		result.Message = "京东登录失败: " + errMsg
+	if retMsg != "" {
+		result.Message = "京东登录失败: " + retMsg
 	} else {
 		result.Message = "京东返回了未知响应"
 	}
 	return result, fmt.Errorf("unknown JD response: retCode=%v retMsg=%s",
-		jdResp["retCode"], errMsg)
+		jdResp["retCode"], retMsg)
 }
 
 // ── callLoginLt ──
