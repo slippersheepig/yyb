@@ -84,14 +84,13 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	}
 
 	// Step 4: Check for successful login via cookies (matching JDCode.py).
-	// Merge jar cookies AND response cookies to handle 302 Set-Cookie correctly.
-	allCookies := append(cookies, resp.Cookies()...)
-	for _, c := range allCookies {
+	// cookies from callLoginLt already merges jar + resp.Cookies().
+	for _, c := range cookies {
 		if c.Name == "pt_key" && c.Value != "" {
 			result.Status = "ok"
 			result.PTKey = c.Value
 			result.Message = "京东登录成功"
-			for _, c2 := range allCookies {
+			for _, c2 := range cookies {
 				if c2.Name == "pt_pin" || c2.Name == "pin" {
 					result.Pin = c2.Value
 				}
@@ -187,13 +186,10 @@ func callLoginLt(ctx context.Context, code string) (map[string]any, []*http.Cook
 	var jdResp map[string]any
 	_ = json.Unmarshal(body, &jdResp)
 
-	// Get cookies from jar (for the JD domain) so pt_key/pt_pin from
-	// across any redirect chain are visible.
+	// Merge jar cookies AND response cookies to capture pt_key/pt_pin
+	// from 302 Set-Cookie headers (jar alone misses them when not following redirects).
 	cookies := jar.Cookies(req.URL)
-	if len(cookies) == 0 {
-		// Fallback: direct Set-Cookie parse.
-		cookies = resp.Cookies()
-	}
+	cookies = append(cookies, resp.Cookies()...)
 
 	return jdResp, cookies, rawBody, nil
 }
