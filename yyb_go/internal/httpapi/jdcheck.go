@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -330,9 +331,13 @@ func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 
 	result, err := a.checkJDLogin(r.Context(), acc)
 	if err != nil && result.Status == "error" {
+		// Push notification to wx message pool
+		a.pushWxNotification(acc.ID, "jd_check", result.Message)
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
+	// Push notification to wx message pool
+	a.pushWxNotification(acc.ID, "jd_check", result.Message)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -365,4 +370,16 @@ func stringContains(s, sub string) bool {
 
 func trimLeadingColon(s string) string {
 	return strings.TrimLeft(s, " \t\r\n:")
+}
+
+// pushWxNotification pushes a JD check result to the wx message pool for the user.
+// Errors are logged but never returned — notification is best-effort.
+func (a *App) pushWxNotification(accountID int64, msgType, content string) {
+	if content == "" {
+		return
+	}
+	_, err := a.db.PushWxMessage(context.Background(), accountID, msgType, content)
+	if err != nil {
+		log.Printf("[wx-push] failed to push wx message for account %d: %v", accountID, err)
+	}
 }
