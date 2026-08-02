@@ -1160,15 +1160,23 @@ func (a *App) handleMyStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	adminCookie, _ := getCookie(r, "yyb_admin")
 	isAdmin := adminCookie != "" && a.webAuth.IsValidAdmin(adminCookie)
+	// Admin 扫码后优先返回当前 session 对应的 account，
+	// 这样 user.html 能正常展示京东验证按钮等用户功能。
 	if isAdmin {
+		acc, err := a.db.GetAccount(r.Context(), sess.WechatAccountID)
+		if err == nil && acc != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"is_admin": true, "account": acc.Public()})
+			return
+		}
+		// fallback: 返回全部账号列表
 		accounts, err := a.db.ListAccounts(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		out := make([]store.AccountPublic, 0, len(accounts))
-		for _, acc := range accounts {
-			out = append(out, acc.Public())
+		for _, a := range accounts {
+			out = append(out, a.Public())
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"is_admin": true, "accounts": out})
 		return
