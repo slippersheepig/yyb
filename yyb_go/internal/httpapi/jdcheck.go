@@ -115,7 +115,20 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		}
 	}
 
-	// Step 5: Check retMsg for SUCCESS — but only trust if we actually got CK.
+	// Step 5: Try sfsRefreshToken — JD often returns sfstoken+pin but no pt_key.
+	// Need to call sfsRefreshToken to exchange sfstoken for pt_key (matching JDCode.py).
+	sfsCk := sfsExchangePtKey(ctx, cookies, jar)
+	if sfsCk != "" {
+		result.Status = "ok"
+		result.PTKey = parseCookieValue(sfsCk, "pt_key")
+		result.Pin = parseCookieValue(sfsCk, "pt_pin")
+		result.Message = "京东登录成功"
+		result.JdCookie = sfsCk
+		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		return result, nil
+	}
+
+	// Step 6: Check retMsg for SUCCESS — but only trust if we actually got CK.
 	retMsg := firstNonEmpty(
 		strVal(jdResp, "retMsg"), strVal(jdResp, "retmsg"),
 		strVal(jdResp, "msg"), strVal(jdResp, "message"),
@@ -281,6 +294,98 @@ func followServerRefresh(ctx context.Context, acrjURL, acrjState string, jar *co
 	}
 
 	return "", fmt.Errorf("follow_server_refresh: no pt_key/pt_pin after 8 hops")
+}
+
+// ── sfsExchangePtKey ──
+
+// sfsExchangePtKey calls JD's sfsRefreshToken endpoint to exchange sfstoken
+// for pt_key, matching JDCode.py's sfs_exchange_pt_key.
+// JD often returns sfstoken+pin cookies but no pt_key; this extra call is needed.
+const jdSfsRefreshURL = "https://wq.jd.com/mlogin/wxapp/sfsRefreshToken"
+
+func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookiejar.Jar) string {
+	sfs := cookieValue(cookies, "sfstoken")
+	pin := cookieValue(cookies, "pin", "pt_pin")
+	if sfs == "" || pin == "" {
+		return ""
+	}
+
+	ctx2, cancel := context.WithTimeout(ctx, jdLoginTimeout)
+	defer cancel()
+
+	params := url.Values{}
+	params.Set("appid", jdAppID)
+	params.Set("pin", pin)
+	params.Set("sfstoken", sfs)
+	params.Set("type", "silent")
+	params.Set("isPopup", "false")
+	params.Set("isIgnoreCookie", "false")
+	params.Set("g_tk", "0")
+	params.Set("g_ty", "ls")
+
+	reqURL := jdSfsRefreshURL + "?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx2, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", uaWx)
+	req.Header.Set("Referer", "https://servicewechat.com/"+jdAppID+"/873/page-frame.html")
+	req.Header.Set("Accept", "application/json,text/plain,*/*")
+
+	client := &http.Client{
+		Timeout: jdLoginTimeout,
+		Jar:     jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+
+	// 1. Check jar + response Set-Cookie.
+	allCk := jar.Cookies(req.URL)
+	allCk = append(allCk, resp.Cookies()...)
+	ck := extractPtCookie(allCk)
+	if ck != "" {
+		return ck
+	}
+
+	// 2. Check response body JSON for pt_key/pt_pin.
+	var sfsResp map[string]any
+	if json.Unmarshal(body, &sfsResp) == nil {
+		bodyCk := extractPtCookieFromBody(sfsResp)
+		if bodyCk != "" {
+			return bodyCk
+		}
+		// 3. Check raw body for cookie pattern.
+		rawCk := parseCookieFromRaw(string(body))
+		if rawCk != "" {
+			return rawCk
+		}
+		// 4. SFS response may contain a new ACRJUrl — follow it.
+		acrjURL := extractACRJUrl(sfsResp, string(body))
+		acrjState := extractACRJState(sfsResp, string(body))
+		if acrjURL != "" {
+			refreshCk, err := followServerRefresh(ctx, acrjURL, acrjState, jar)
+			if err == nil && refreshCk != "" {
+				return refreshCk
+			}
+		}
+	}
+
+	// 5. Fallback: check raw body.
+	rawCk := parseCookieFromRaw(string(body))
+	if rawCk != "" {
+		return rawCk
+	}
+
+	return ""
 }
 
 // ── cookie helpers ──
