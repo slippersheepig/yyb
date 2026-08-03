@@ -407,7 +407,7 @@ func resolveURL(base, ref string) string {
 	}
 	baseParsed, err := url.Parse(base)
 	if err == nil {
-		resolved := baseParsed.ResolveRef(&url.URL{Path: ref})
+		resolved := baseParsed.ResolveReference(&url.URL{Path: ref})
 		return resolved.String()
 	}
 	return ref
