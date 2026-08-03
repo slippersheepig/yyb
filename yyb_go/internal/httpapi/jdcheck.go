@@ -41,8 +41,10 @@ const uaWx = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
 const jdPTAppID = "wx2f5d8f9715c59d10"
 const jdPTApp = "300"
 const jdPTReturnURL = "https://my.m.jd.com/account/index.html"
-const uaPT = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
-	"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148"
+const uaPT = "Mozilla/5.0 (Linux; Android 10; Pixel 4 XL) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 " +
+	"Mobile Safari/537.36 MicroMessenger/7.0.20.1781 " +
+	"NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF"
 
 // ── checkJDLogin ──
 
