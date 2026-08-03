@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -33,6 +34,13 @@ const jdLoginLtURL = "https://wq.jd.com/mlogin/wxapp/login_lt"
 const uaWx = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
 	"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 " +
 	"MicroMessenger/8.0.49 NetType/WIFI Language/zh_CN miniProgram/" + jdAppID
+
+// PT OAuth constants (matching JDCode.py jd_pt_cookie_login).
+const jdPTAppID = "wx2f5d8f9715c59d10"
+const jdPTApp = "300"
+const jdPTReturnURL = "https://my.m.jd.com/account/index.html"
+const uaPT = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
+	"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148"
 
 // ── checkJDLogin ──
 
@@ -126,6 +134,23 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		result.JdCookie = sfsCk
 		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 		return result, nil
+	}
+
+	// Step 5.5: PT exchange — use PT appid to get a fresh code, then walk the PT OAuth chain.
+	ptCode, ptErr := a.pool.GetCode(ctx, acc.LoginBuffer, jdPTAppID, acc.ID, a.cfg.TCPProxy)
+	if ptErr == nil && ptCode != nil {
+		if ptCodeVal, ok := ptCode["code"].(string); ok && ptCodeVal != "" {
+			ptCk := jdPtCookieLogin(ctx, ptCodeVal)
+			if ptCk != "" {
+				result.Status = "ok"
+				result.PTKey = parseCookieValue(ptCk, "pt_key")
+				result.Pin = parseCookieValue(ptCk, "pt_pin")
+				result.Message = "京东登录成功"
+				result.JdCookie = ptCk
+				_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+				return result, nil
+			}
+		}
 	}
 
 	// Step 6: Check retMsg for SUCCESS — but only trust if we actually got CK.
@@ -636,6 +661,176 @@ func normaliseJDUrl(raw string) string {
 		return "https://wq.jd.com" + raw
 	}
 	return raw
+}
+
+// ── jdPtCookieLogin (Step 5.5: PT OAuth chain) ──
+
+// jdPtCookieLogin walks the JD PT OAuth redirect chain (matching JDCode.py
+// jd_pt_cookie_login) to capture pt_key/pt_pin cookies.
+func jdPtCookieLogin(ctx context.Context, code string) string {
+	ctx2, cancel := context.WithTimeout(ctx, jdLoginTimeout)
+	defer cancel()
+
+	jdPtHeaders := map[string]string{
+		"User-Agent":      uaPT,
+		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Accept-Language": "zh-CN,zh;q=0.9",
+	}
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Timeout: jdLoginTimeout,
+		Jar:     jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// 1. Hit login.action to get the OAuth redirect.
+	loginParams := url.Values{}
+	loginParams.Set("appid", jdPTApp)
+	loginParams.Set("returnurl", jdPTReturnURL)
+	loginURL := "https://plogin.m.jd.com/user/login.action?" + loginParams.Encode()
+
+	req, err := http.NewRequestWithContext(ctx2, http.MethodGet, loginURL, nil)
+	if err != nil {
+		return ""
+	}
+	for k, v := range jdPtHeaders {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		return ""
+	}
+
+	location := resp.Header.Get("Location")
+	if location == "" {
+		return ""
+	}
+
+	oauthURL := resolveURL(loginURL, location)
+	oauthParsed, err := url.Parse(oauthURL)
+	if err != nil {
+		return ""
+	}
+	oauthQuery := oauthParsed.Query()
+	if oauthQuery.Get("appid") != jdPTAppID {
+		return ""
+	}
+	redirectURI := oauthQuery.Get("redirect_uri")
+	state := oauthQuery.Get("state")
+	if redirectURI == "" || state == "" {
+		return ""
+	}
+
+	// 2. Build callback URL with code+state appended.
+	callbackParsed, err := url.Parse(redirectURI)
+	if err != nil {
+		return ""
+	}
+	callbackQuery := callbackParsed.Query()
+	if callbackQuery == nil {
+		callbackQuery = url.Values{}
+	}
+	callbackQuery.Set("code", code)
+	callbackQuery.Set("state", state)
+	callbackParsed.RawQuery = callbackQuery.Encode()
+	current := callbackParsed.String()
+
+	// 3. Walk the redirect chain (up to 8 hops).
+	for i := 0; i < 8; i++ {
+		if !allowedJDURL(current) {
+			return ""
+		}
+
+		req, err := http.NewRequestWithContext(ctx2, http.MethodGet, current, nil)
+		if err != nil {
+			return ""
+		}
+		for k, v := range jdPtHeaders {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return ""
+		}
+
+		// Check jar + response Set-Cookie.
+		allCk := jar.Cookies(req.URL)
+		allCk = append(allCk, resp.Cookies()...)
+		ck := extractPtCookie(allCk)
+		if ck != "" {
+			resp.Body.Close()
+			return ck
+		}
+
+		// Read body for fallback checks.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		rawBody := string(body)
+
+		// Check raw body for cookie pattern.
+		rawCk := parseCookieFromRaw(rawBody)
+		if rawCk != "" {
+			return rawCk
+		}
+
+		// Check body JSON.
+		var bodyJSON map[string]any
+		if json.Unmarshal(body, &bodyJSON) == nil {
+			bodyCk := extractPtCookieFromBody(bodyJSON)
+			if bodyCk != "" {
+				return bodyCk
+			}
+		}
+
+		// Follow redirect.
+		loc := resp.Header.Get("Location")
+		statusCode := resp.StatusCode
+
+		// If no Location header but 200, try HTML meta/JS redirect.
+		if loc == "" && statusCode == 200 {
+			loc = jdPtHTMLRedirect(current, rawBody)
+		}
+
+		if loc == "" || statusCode < 200 || statusCode > 399 {
+			break
+		}
+
+		current = resolveURL(current, loc)
+	}
+
+	return ""
+}
+
+// jdPtHTMLRedirect extracts a redirect URL from HTML meta refresh or JS location
+// assignments (matching JDCode.py jd_pt_html_redirect).
+var ptRedirectPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)<meta[^>]+url\s*=\s*["']?([^"' >]+)`),
+	regexp.MustCompile(`(?i)(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)`),
+	regexp.MustCompile(`(?i)location\.replace\s*\(\s*["']([^"']+)`),
+	regexp.MustCompile(`(?i)location\.assign\s*\(\s*["']([^"']+)`),
+}
+
+func jdPtHTMLRedirect(baseURL, raw string) string {
+	for _, pat := range ptRedirectPatterns {
+		m := pat.FindStringSubmatch(raw)
+		if m != nil {
+			candidate := strings.TrimSpace(m[1])
+			if candidate != "" {
+				return resolveURL(baseURL, candidate)
+			}
+		}
+	}
+	return ""
 }
 
 // ── handleMyJdCheck ──
