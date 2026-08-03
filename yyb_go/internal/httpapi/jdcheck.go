@@ -17,66 +17,49 @@ import (
 
 // ── JDCheckResult ──
 
-// JDCheckResult is the JSON response for POST /api/my/jd-check.
 type JDCheckResult struct {
-	Status   string `json:"status"`              // "ok" | "risk" | "error"
-	Message  string `json:"message,omitempty"`   // human-readable summary
-	RiskURL  string `json:"risk_url,omitempty"`  // ACRJUrl if risk verification needed
-	PTKey    string `json:"pt_key,omitempty"`    // pt_key if login succeeded
-	Pin      string `json:"pt_pin,omitempty"`    // pt_pin if login succeeded
-	JdCookie string `json:"jd_cookie,omitempty"` // assembled cookie string: pt_key=xxx;pt_pin=xxx;
-	Raw      string `json:"raw,omitempty"`      // truncated raw JD response for debugging
+	Status   string `json:"status"`
+	Message  string `json:"message,omitempty"`
+	RiskURL  string `json:"risk_url,omitempty"`
+	PTKey    string `json:"pt_key,omitempty"`
+	Pin      string `json:"pt_pin,omitempty"`
+	JdCookie string `json:"jd_cookie,omitempty"`
+	Raw      string `json:"raw,omitempty"`
 }
 
-// ── Constants (aligned with JDCode.py) ──
-
 const jdLoginTimeout = 15 * time.Second
-
-// JD mini-program app_id (京东购物小程序) — from JDCode.py CONFIG_JD_APPID.
 const jdAppID = "wx91d27dbf599dff74"
-
-// JD login endpoint — login_lt, exactly as JDCode.py calls it.
 const jdLoginLtURL = "https://wq.jd.com/mlogin/wxapp/login_lt"
-
-// MicroMessenger User-Agent matching JDCode.py UA_WX.
 const uaWx = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
 	"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 " +
 	"MicroMessenger/8.0.49 NetType/WIFI Language/zh_CN miniProgram/" + jdAppID
 
 // ── checkJDLogin ──
 
-// checkJDLogin does the full flow:
-//  1. Call yyb's pool.GetCode to get a wx mini-program code.
-//  2. GET login_lt with the code and all required params.
-//  3. Parse the response: if ACRJUrl → risk; if pt_key cookie → ok.
 func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDCheckResult, error) {
-	// Step 1: get mini-program code via yyb's existing pool.
 	codeResult, err := a.pool.GetCode(ctx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
 	if err != nil {
 		return JDCheckResult{Status: "error", Message: "获取小程序 code 失败: " + err.Error()}, err
 	}
 	code, ok := codeResult["code"].(string)
 	if !ok || code == "" {
-		return JDCheckResult{Status: "error", Message: "小程序 code 为空"}, fmt.Errorf("empty code from GetCode")
+		return JDCheckResult{Status: "error", Message: "小程序 code 为空"}, fmt.Errorf("empty code")
 	}
 
-	// Step 2: GET login_lt with all required parameters (matching JDBC.py).
-	jdResp, cookies, rawBody, err := callLoginLt(ctx, code)
+	jdResp, cookies, rawBody, jar, _, err := callLoginLt(ctx, code)
 	if err != nil {
 		return JDCheckResult{Status: "error", Message: "京东登录请求失败: " + err.Error()}, err
 	}
 
-	// Truncate raw body for debugging.
 	rawStr := rawBody
 	if len(rawStr) > 800 {
 		rawStr = rawStr[:800]
 	}
 	result := JDCheckResult{Raw: rawStr}
 
-	// Step 3: Check for risk verification URL (ACRJUrl).
-	// JD returns ACRJUrl in the "info" field or nested under "data".
+	// Step 1: Check for risk verification URL.
 	riskURL := extractACRJUrl(jdResp, rawBody)
-	if riskURL != "" {
+	if riskURL != "" && isRiskURL(riskURL) {
 		result.Status = "risk"
 		result.RiskURL = riskURL
 		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证"
@@ -84,75 +67,82 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		return result, nil
 	}
 
-	// Step 4: Check for successful login via cookies (matching JDCode.py).
-	// cookies from callLoginLt already merges jar + resp.Cookies().
-	for _, c := range cookies {
-		if c.Name == "pt_key" && c.Value != "" {
+	// Step 2: Check for pt_key in initial response cookies.
+	ck := extractPtCookie(cookies)
+	if ck != "" {
+		result.Status = "ok"
+		result.PTKey = cookieValue(cookies, "pt_key")
+		result.Pin = cookieValue(cookies, "pt_pin", "pin")
+		result.Message = "京东登录成功"
+		result.JdCookie = ck
+		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		return result, nil
+	}
+
+	// Step 3: Check response body JSON for pt_key/pt_pin.
+	bodyCk := extractPtCookieFromBody(jdResp)
+	if bodyCk != "" {
+		result.Status = "ok"
+		result.PTKey = parseCookieValue(bodyCk, "pt_key")
+		result.Pin = parseCookieValue(bodyCk, "pt_pin")
+		result.Message = "京东登录成功"
+		result.JdCookie = bodyCk
+		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		return result, nil
+	}
+
+	// Step 4: Follow server-side refresh redirect chain (matching JDCode.py).
+	acrjURL := extractACRJUrl(jdResp, rawBody)
+	acrjState := extractACRJState(jdResp, rawBody)
+	if acrjURL != "" {
+		refreshCk, err := followServerRefresh(ctx, acrjURL, acrjState, jar)
+		if err == nil && refreshCk != "" {
 			result.Status = "ok"
-			result.PTKey = c.Value
+			result.PTKey = parseCookieValue(refreshCk, "pt_key")
+			result.Pin = parseCookieValue(refreshCk, "pt_pin")
 			result.Message = "京东登录成功"
-			for _, c2 := range cookies {
-				if c2.Name == "pt_pin" || c2.Name == "pin" {
-					result.Pin = c2.Value
-				}
-			}
-			// Assemble the JD cookie string for easy copy
-			if result.PTKey != "" {
-				result.JdCookie = "pt_key=" + result.PTKey + ";pt_pin=" + result.Pin + ";"
-				// Persist CK to DB so user can retrieve it later without re-running check
-				_ = a.db.SetJdCookie(ctx, acc.ID, result.JdCookie)
-			}
+			result.JdCookie = refreshCk
 			_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+			return result, nil
+		}
+		// If follow failed and URL looks like risk, return as risk.
+		if isRiskURL(acrjURL) {
+			result.Status = "risk"
+			result.RiskURL = acrjURL
+			result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证"
+			_ = a.db.SetJdRiskURL(ctx, acc.ID, acrjURL)
 			return result, nil
 		}
 	}
 
-	// Neither risk URL nor pt_key cookie — unknown state.
-	// Check retMsg: if it contains "SUCCESS", treat as ok (cookie not captured but login succeeded).
+	// Step 5: Check retMsg for SUCCESS — but only trust if we actually got CK.
 	retMsg := firstNonEmpty(
 		strVal(jdResp, "retMsg"), strVal(jdResp, "retmsg"),
 		strVal(jdResp, "msg"), strVal(jdResp, "message"),
 		strVal(jdResp, "errmsg"), strVal(jdResp, "errMsg"),
 	)
 	if strings.Contains(strings.ToUpper(retMsg), "SUCCESS") {
-		result.Status = "ok"
-		result.Message = "京东登录成功"
-		// Try to assemble CK from any cookies we captured even in this branch
-		for _, c := range cookies {
-			if c.Name == "pt_key" && c.Value != "" {
-				result.PTKey = c.Value
-			}
-			if (c.Name == "pt_pin" || c.Name == "pin") && c.Value != "" {
-				result.Pin = c.Value
-			}
-		}
-		if result.PTKey != "" {
-			result.JdCookie = "pt_key=" + result.PTKey + ";pt_pin=" + result.Pin + ";"
-			_ = a.db.SetJdCookie(ctx, acc.ID, result.JdCookie)
-		}
-		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
-		return result, nil
+		// Don't fake success — if no CK was captured, report error.
+		result.Status = "error"
+		result.Message = "京东返回成功但未捕获到Cookie，请重新验证"
+		return result, fmt.Errorf("SUCCESS but no pt_key/pt_pin captured")
 	}
+
 	result.Status = "error"
 	if retMsg != "" {
 		result.Message = "京东登录失败: " + retMsg
 	} else {
 		result.Message = "京东返回了未知响应"
 	}
-	return result, fmt.Errorf("unknown JD response: retCode=%v retMsg=%s",
-		jdResp["retCode"], retMsg)
+	return result, fmt.Errorf("unknown JD response: retCode=%v retMsg=%s", jdResp["retCode"], retMsg)
 }
 
 // ── callLoginLt ──
 
-// callLoginLt calls JD's login_lt endpoint as a GET with all required query
-// parameters, matching JDBC.py's call_login_lt.
-// Returns the parsed JSON payload (map), cookies, and raw body string.
-func callLoginLt(ctx context.Context, code string) (map[string]any, []*http.Cookie, string, error) {
+func callLoginLt(ctx context.Context, code string) (map[string]any, []*http.Cookie, string, *cookiejar.Jar, *url.URL, error) {
 	ctx, cancel := context.WithTimeout(ctx, jdLoginTimeout)
 	defer cancel()
 
-	// Build query params matching JDCode.py call_login_lt.
 	params := url.Values{}
 	params.Set("appid", jdAppID)
 	params.Set("code", code)
@@ -170,17 +160,14 @@ func callLoginLt(ctx context.Context, code string) (map[string]any, []*http.Cook
 	params.Set("g_ty", "ls")
 
 	reqURL := jdLoginLtURL + "?" + params.Encode()
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", nil, nil, err
 	}
 	req.Header.Set("User-Agent", uaWx)
 	req.Header.Set("Referer", "https://servicewechat.com/"+jdAppID+"/873/page-frame.html")
 	req.Header.Set("Accept", "application/json,text/plain,*/*")
 
-	// Use a cookie jar to properly capture Set-Cookie headers (pt_key, pt_pin).
-	// Don't follow redirects — same behavior as JDCode.py's IncludedHandler.
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{
 		Timeout: jdLoginTimeout,
@@ -192,62 +179,270 @@ func callLoginLt(ctx context.Context, code string) (map[string]any, []*http.Cook
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", nil, nil, err
 	}
 	rawBody := string(body)
 
-	// Parse JSON body.
 	var jdResp map[string]any
 	_ = json.Unmarshal(body, &jdResp)
 
-	// Merge jar cookies AND response cookies to capture pt_key/pt_pin
-	// from 302 Set-Cookie headers (jar alone misses them when not following redirects).
 	cookies := jar.Cookies(req.URL)
 	cookies = append(cookies, resp.Cookies()...)
 
-	return jdResp, cookies, rawBody, nil
+	return jdResp, cookies, rawBody, jar, resp.Request.URL, nil
 }
 
-// ── extractACRJUrl ──
+// ── followServerRefresh ──
 
-// extractACRJUrl locates the A / risk verification URL in a JD login_lt
-// response, using the same strategy as JDCode.py's login_info +
-// follow_server_refresh.
+// followServerRefresh follows the JD server-side refresh redirect chain
+// (matching JDCode.py's follow_server_refresh) to capture pt_key/pt_pin.
+func followServerRefresh(ctx context.Context, acrjURL, acrjState string, jar *cookiejar.Jar) (string, error) {
+	current := normaliseJDUrl(acrjURL)
+	if current == "" {
+		return "", fmt.Errorf("empty ACRJUrl")
+	}
+
+	if acrjState != "" && !strings.Contains(current, "ACRJState=") {
+		parsed, err := url.Parse(current)
+		if err == nil {
+			q := parsed.Query()
+			q.Set("ACRJState", acrjState)
+			parsed.RawQuery = q.Encode()
+			current = parsed.String()
+		}
+	}
+
+	client := &http.Client{
+		Timeout: jdLoginTimeout,
+		Jar:     jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	for i := 0; i < 8; i++ {
+		if !allowedJDURL(current) {
+			return "", fmt.Errorf("server refresh URL not trusted: %s", current)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", uaWx)
+		req.Header.Set("Referer", "https://servicewechat.com/"+jdAppID+"/873/page-frame.html")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json,*/*;q=0.8")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+
+		// Check jar + response Set-Cookie.
+		allCk := jar.Cookies(req.URL)
+		allCk = append(allCk, resp.Cookies()...)
+		ck := extractPtCookie(allCk)
+		if ck != "" {
+			resp.Body.Close()
+			return ck, nil
+		}
+
+		// Check response body for pt_key/pt_pin.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+
+		var bodyJSON map[string]any
+		if json.Unmarshal(body, &bodyJSON) == nil {
+			bodyCk := extractPtCookieFromBody(bodyJSON)
+			if bodyCk != "" {
+				return bodyCk, nil
+			}
+		}
+
+		// Check raw body for cookie pattern.
+		rawCk := parseCookieFromRaw(string(body))
+		if rawCk != "" {
+			return rawCk, nil
+		}
+
+		// Follow redirect.
+		location := resp.Header.Get("Location")
+		if location == "" {
+			break
+		}
+		current = resolveURL(current, location)
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	return "", fmt.Errorf("follow_server_refresh: no pt_key/pt_pin after 8 hops")
+}
+
+// ── cookie helpers ──
+
+func extractPtCookie(cookies []*http.Cookie) string {
+	var ptKey, ptPin string
+	for _, c := range cookies {
+		switch c.Name {
+		case "pt_key":
+			if c.Value != "" {
+				ptKey = c.Value
+			}
+		case "pt_pin", "pin":
+			if c.Value != "" && ptPin == "" {
+				ptPin = c.Value
+			}
+		}
+	}
+	if ptKey == "" || ptPin == "" {
+		return ""
+	}
+	return "pt_key=" + ptKey + ";pt_pin=" + ptPin + ";"
+}
+
+func cookieValue(cookies []*http.Cookie, names ...string) string {
+	for _, name := range names {
+		for _, c := range cookies {
+			if c.Name == name && c.Value != "" {
+				return c.Value
+			}
+		}
+	}
+	return ""
+}
+
+func parseCookieValue(cookieStr, key string) string {
+	prefix := key + "="
+	for _, part := range strings.Split(cookieStr, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, prefix) {
+			return strings.TrimPrefix(part, prefix)
+		}
+	}
+	return ""
+}
+
+func extractPtCookieFromBody(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	ptKey := strVal(m, "pt_key")
+	ptPin := strVal(m, "pt_pin")
+	if ptKey == "" {
+		if info, ok := m["info"].(map[string]any); ok {
+			ptKey = strVal(info, "pt_key")
+			ptPin = strVal(info, "pt_pin")
+		}
+	}
+	if ptKey == "" {
+		if data, ok := m["data"].(map[string]any); ok {
+			ptKey = strVal(data, "pt_key")
+			ptPin = strVal(data, "pt_pin")
+		}
+	}
+	if ptKey != "" && ptPin != "" {
+		return "pt_key=" + ptKey + ";pt_pin=" + ptPin + ";"
+	}
+	return ""
+}
+
+func parseCookieFromRaw(raw string) string {
+	ptKey := extractRawValue(raw, "pt_key=")
+	ptPin := extractRawValue(raw, "pt_pin=")
+	if ptKey != "" && ptPin != "" {
+		return "pt_key=" + ptKey + ";pt_pin=" + ptPin + ";"
+	}
+	return ""
+}
+
+func extractRawValue(s, prefix string) string {
+	idx := strings.Index(s, prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := s[idx+len(prefix):]
+	end := len(rest)
+	for i, ch := range rest {
+		if ch == ';' || ch == ',' || ch == ' ' || ch == '"' || ch == ')' || ch == '\n' || ch == '\r' {
+			end = i
+			break
+		}
+	}
+	return rest[:end]
+}
+
+// ── URL helpers ──
+
+func allowedJDURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if parsed.Scheme != "https" {
+		return false
+	}
+	return host == "jd.com" || strings.HasSuffix(host, ".jd.com") ||
+		host == "jd.hk" || strings.HasSuffix(host, ".jd.hk") ||
+		host == "3.cn" || strings.HasSuffix(host, ".3.cn")
+}
+
+func resolveURL(base, ref string) string {
+	if strings.HasPrefix(ref, "//") {
+		return "https:" + ref
+	}
+	if strings.HasPrefix(ref, "/") {
+		parsed, err := url.Parse(base)
+		if err == nil {
+			return parsed.Scheme + "://" + parsed.Host + ref
+		}
+	}
+	if strings.HasPrefix(ref, "https://") || strings.HasPrefix(ref, "http://") {
+		return ref
+	}
+	baseParsed, err := url.Parse(base)
+	if err == nil {
+		resolved := baseParsed.ResolveRef(&url.URL{Path: ref})
+		return resolved.String()
+	}
+	return ref
+}
+
+func isRiskURL(rawURL string) bool {
+	return strings.Contains(rawURL, "/risk/") ||
+		strings.Contains(rawURL, "risk") ||
+		strings.Contains(rawURL, "verify")
+}
+
+// ── ACRJUrl extraction ──
+
 func extractACRJUrl(jdResp map[string]any, rawBody string) string {
 	if jdResp == nil {
 		return ""
 	}
-
-	// Strategy 1: response.info.ACBJUrl (when info is a JSON object).
 	if info, ok := jdResp["info"]; ok {
-		// info may be a parsed dict/map or a string.
 		switch v := info.(type) {
 		case map[string]any:
 			if u := strVal(v, "ACRJUrl"); u != "" {
 				return normaliseJDUrl(u)
 			}
 		case string:
-			// Try to parse it as JSON.
 			var m map[string]any
 			if json.Unmarshal([]byte(v), &m) == nil {
 				if u := strVal(m, "ACRJUrl"); u != "" {
 					return normaliseJDUrl(u)
 				}
 			}
-			// Maybe it's a direct URL.
 			if strings.HasPrefix(v, "https://") && stringContains(v, "risk") {
 				return normaliseJDUrl(v)
 			}
 		}
 	}
-
-	// Strategy 2: jdResp["data"]["info"]["ACRJUrl"].
 	if data, ok := jdResp["data"].(map[string]any); ok {
 		if info, ok := data["info"]; ok {
 			if m, ok := info.(map[string]any); ok {
@@ -256,19 +451,44 @@ func extractACRJUrl(jdResp map[string]any, rawBody string) string {
 				}
 			}
 		}
-		// data["ACRJUrl"] directly.
 		if u := strVal(data, "ACRJUrl"); u != "" {
 			return normaliseJDUrl(u)
 		}
 	}
-
-	// Fallback: full-text search in raw body for ACRNUrl pathern.
 	return searchRawBodyForRiskUrl(rawBody)
 }
 
-// searchRawBodyForRiskUrl scans the raw body for a risk URL pathet.
+func extractACRJState(jdResp map[string]any, rawBody string) string {
+	if jdResp == nil {
+		return ""
+	}
+	if info, ok := jdResp["info"].(map[string]any); ok {
+		if s := strVal(info, "ACRJState"); s != "" {
+			return s
+		}
+	}
+	if data, ok := jdResp["data"].(map[string]any); ok {
+		if info, ok := data["info"].(map[string]any); ok {
+			if s := strVal(info, "ACRJState"); s != "" {
+				return s
+			}
+		}
+	}
+	idx := strings.Index(rawBody, `"ACRJState"`)
+	if idx >= 0 {
+		rest := rawBody[idx+len(`"ACRJState"`):]
+		rest = trimLeadingColon(rest)
+		if strings.HasPrefix(rest, `"`) {
+			end := strings.Index(rest[1:], `"`)
+			if end >= 0 {
+				return rest[1 : 1+end]
+			}
+		}
+	}
+	return ""
+}
+
 func searchRawBodyForRiskUrl(rawBody string) string {
-	// Pattern 1: "ACRJUrl":"https://..."
 	idx := strings.Index(rawBody, `"ACRJUrl"`)
 	if idx >= 0 {
 		rest := rawBody[idx+len(`"ACRJUrl"`):]
@@ -280,8 +500,6 @@ func searchRawBodyForRiskUrl(rawBody string) string {
 			}
 		}
 	}
-
-	// Pattern 2: Direct risk URL in body.
 	riskPrefixes := []string{
 		"https://wq.jd.com/h5/risk/",
 		"https://plogin.m.jd.com/h5/risk/",
@@ -302,7 +520,6 @@ func searchRawBodyForRiskUrl(rawBody string) string {
 		}
 		return rest
 	}
-
 	return ""
 }
 
@@ -318,13 +535,11 @@ func normaliseJDUrl(raw string) string {
 
 // ── handleMyJdCheck ──
 
-// handleMyJdCheck is the HTTP handler for POST /api/my/jd-check.
 func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-
 	token, _ := getCookie(r, "yyb_user")
 	if token == "" {
 		writeError(w, http.StatusUnauthorized, "未登录")
@@ -355,47 +570,25 @@ func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 
 	result, err := a.checkJDLogin(r.Context(), acc)
 	if err != nil && result.Status == "error" {
-		// Push notification to wx message pool
 		a.pushWxNotification(acc.ID, "jd_check", result.Message)
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
-	// Push notification to wx message pool
 	a.pushWxNotification(acc.ID, "jd_check", result.Message)
 	writeJSON(w, http.StatusOK, result)
 }
 
 // ── handleMyJdCookie ──
 
-// handleMyJdCookie returns the stored JD cookie for the logged-in user.
-// GET /api/my/jd-cookie
+// handleMyJdCookie always returns empty — YYB does not persist JD CK to DB.
 func (a *App) handleMyJdCookie(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	token, _ := getCookie(r, "yyb_user")
-	if token == "" {
-		writeError(w, http.StatusUnauthorized, "未登录")
-		return
-	}
-	sess, err := a.db.GetUserSession(r.Context(), token)
-	if err != nil || sess == nil {
-		writeError(w, http.StatusUnauthorized, "会话已过期")
-		return
-	}
-	acc, err := a.db.GetAccount(r.Context(), sess.WechatAccountID)
-	if err != nil || acc == nil {
-		writeError(w, http.StatusNotFound, "账号不存在")
-		return
-	}
-	ck := ""
-	if acc.JdCookie != nil {
-		ck = *acc.JdCookie
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"jd_cookie":  ck,
-		"has_cookie": ck != "",
+		"jd_cookie":  "",
+		"has_cookie": false,
 	})
 }
 
@@ -430,8 +623,6 @@ func trimLeadingColon(s string) string {
 	return strings.TrimLeft(s, " \t\r\n:")
 }
 
-// pushWxNotification pushes a JD check result to the wx message pool for the user.
-// Errors are logged but never returned — notification is best-effort.
 func (a *App) pushWxNotification(accountID int64, msgType, content string) {
 	if content == "" {
 		return
