@@ -251,10 +251,9 @@
           // 验证成功，持有CK并显示复制按钮
           if (resp.jd_cookie) {
             _jdCk = resp.jd_cookie;
+            const copyBtn = $('copyCkBtn');
+            if (copyBtn) copyBtn.style.display = 'inline-block';
           }
-          // 无条件显示按钮：即使jd_cookie被omitempty吞掉也能显示
-          const copyBtn = $('copyCkBtn');
-          if (copyBtn) copyBtn.style.display = 'inline-block';
         } else if (resp.status === 'risk') {
           result.className = 'jd-result risk';
           result.style.display = 'block';
@@ -326,11 +325,8 @@
           riskBanner = `<div class="jd-result" id="jdResult"></div>`;
         }
 
-        // 如果DB里已有CK，预加载到内存并标记需要显示按钮
-        if (acc.jd_cookie) {
-          _jdCk = acc.jd_cookie;
-        }
-        const showCopyBtn = _jdCk ? ' style="display:inline-block"' : '';
+        // YYB不持久化CK，不从DB预加载
+        const showCopyBtn = '';
 
         card.innerHTML = `
           <div class="card-header">
