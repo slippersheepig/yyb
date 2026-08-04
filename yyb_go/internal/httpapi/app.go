@@ -115,13 +115,13 @@ func NewApp(cfg Config) (*App, error) {
 // all alive accounts' credentials before they expire.
 //
 // Strategy:
-//   - Check every 90 minutes (low frequency)
+//   - Check every 30 minutes (low frequency)
 //   - Only refresh accounts whose access token expires within 30 minutes
 //   - On refresh failure, retry up to 2 times with 10s delay
 //   - If all retries fail, mark account as "expired" (no notification)
 //   - No Telegram notifications; if it expires, it expires
 func (a *App) StartAutoRefresh(ctx context.Context) {
-	ticker := time.NewTicker(90 * time.Minute)
+	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 	// Run once on startup after a short delay to let the server bind first.
 	time.Sleep(10 * time.Second)
@@ -143,7 +143,7 @@ func (a *App) autoRefreshAll(ctx context.Context) {
 		return
 	}
 	now := time.Now().Unix()
-	const refreshWindow = 30 * 60 // 30 minutes before expiry
+	const refreshWindow = 60 * 60 // 60 minutes before expiry
 	for _, acc := range accounts {
 		// Skip accounts without credentials or already expired
 		if acc.Credentials == nil {
