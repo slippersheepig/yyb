@@ -257,8 +257,11 @@
         } else if (resp.status === 'risk') {
           result.className = 'jd-result risk';
           result.style.display = 'block';
+          const expireNote = resp.risk_expire_at
+            ? `（链接将在 ${new Date(resp.risk_expire_at * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'})} 失效）`
+            : '（链接 30 分钟内有效）';
           result.innerHTML = `<div class="jd-title">⚠️ ${escapeHTML(resp.message || '需要风险认证')}</div>` +
-            `<div>请点击下方链接在浏览器中完成认证，完成后点击「重新验证」</div>` +
+            `<div>请点击下方链接在新窗口中完成认证，完成后回到本页点击「重新验证」${escapeHTML(expireNote)}</div>` +
             `<a class="jd-link" href="${escapeHTML(resp.risk_url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(resp.risk_url)}</a>`;
         } else {
           result.className = 'jd-result error';
@@ -312,15 +315,25 @@
         const card = $('userCard');
         const name = acc.nickname || acc.alias || '微信用户';
 
-        // Build JD risk banner if there's a persisted risk URL
+        // Build JD risk banner if there's a persisted risk URL (frontend expiry check)
         let riskBanner = '';
         if (acc.jd_risk_url) {
-          riskBanner = `
+          // Frontend expiry check: if jd_risk_expire_at is set and past, don't show the banner
+          const now = Math.floor(Date.now() / 1000);
+          const expired = acc.jd_risk_expire_at && acc.jd_risk_expire_at <= now;
+          if (!expired) {
+            const expireStr = acc.jd_risk_expire_at
+              ? `（链接将在 ${new Date(acc.jd_risk_expire_at * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'})} 失效）`
+              : '';
+            riskBanner = `
             <div class="jd-result risk" id="jdResult" style="display:block">
               <div class="jd-title">⚠️ 上次验证需要风险认证</div>
-              <div>请点击下方链接在浏览器中完成认证，完成后点击「重新验证」</div>
+              <div>请点击下方链接在新窗口中完成认证，完成后回到本页点击「重新验证」${escapeHTML(expireStr)}</div>
               <a class="jd-link" href="${escapeHTML(acc.jd_risk_url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(acc.jd_risk_url)}</a>
             </div>`;
+          } else {
+            riskBanner = `<div class="jd-result" id="jdResult"></div>`;
+          }
         } else {
           riskBanner = `<div class="jd-result" id="jdResult"></div>`;
         }
