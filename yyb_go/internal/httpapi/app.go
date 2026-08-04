@@ -39,8 +39,6 @@ type Config struct {
 	TGAdminIDs     []int64
 	WebUser        string
 	WebPass        string
-	WxGzhLink      string
-	WxGzhName      string
 }
 
 type App struct {
@@ -236,12 +234,6 @@ func (a *App) Handler() http.Handler {
     userGroup.Any("/api/my/avatar", gin.WrapF(a.handleMyAvatar))
     userGroup.Any("/api/my/jd-check", gin.WrapF(a.handleMyJdCheck))
     userGroup.Any("/api/my/jd-cookie", gin.WrapF(a.handleMyJdCookie))
-    userGroup.Any("/api/wx/bind-code", gin.WrapF(a.handleWxBindCode))
-    userGroup.Any("/api/wx/bind-status", gin.WrapF(a.handleWxBindStatus))
-
-    // ── 公开的微信绑定/取件路由──
-    router.Any("/api/wx/bind", gin.WrapF(a.handleWxBind))
-    router.Any("/api/wx/pending", gin.WrapF(a.handleWxPending))
 
     // ── 受保护路由（需要鉴权）──
     protected := router.Group("", a.authMiddleware())
@@ -257,7 +249,6 @@ func (a *App) Handler() http.Handler {
     protected.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
     protected.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
     protected.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
-    protected.Any("/api/wx/push", gin.WrapF(a.handleWxPush))
 
     router.NoRoute(func(c *gin.Context) {
         writeError(c.Writer, http.StatusNotFound, "not found")
@@ -1161,23 +1152,15 @@ func (a *App) handleMyStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	adminCookie, _ := getCookie(r, "yyb_admin")
 	isAdmin := adminCookie != "" && a.webAuth.IsValidAdmin(adminCookie)
-	// Admin 扫码后优先返回当前 session 对应的 account，
-	// 这样 user.html 能正常展示京东验证按钮等用户功能。
 	if isAdmin {
-		acc, err := a.db.GetAccount(r.Context(), sess.WechatAccountID)
-		if err == nil && acc != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"is_admin": true, "account": acc.Public()})
-			return
-		}
-		// fallback: 返回全部账号列表
 		accounts, err := a.db.ListAccounts(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		out := make([]store.AccountPublic, 0, len(accounts))
-		for _, a := range accounts {
-			out = append(out, a.Public())
+		for _, acc := range accounts {
+			out = append(out, acc.Public())
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"is_admin": true, "accounts": out})
 		return
