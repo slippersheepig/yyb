@@ -1,0 +1,195 @@
+# Auto-update Go version in Dockerfile & go.mod, then build & push image.
+#
+# Schedule: every Monday 08:00 UTC (16:00 Beijing).
+# Also runnable via workflow_dispatch with an optional Go version override.
+#
+# What it does:
+#   1. Fetches the latest stable Go release from go.dev/dl?mode=json
+#   2. Updates Dockerfile: FROM golang:<ver>-alpine
+#   3. Updates go.mod:   go <ver>
+#   4. Runs `go mod tidy` to refresh go.sum
+#   5. Commits the changes (if any) and pushes
+#   6. Triggers the existing docker-build.yml workflow via workflow_dispatch
+#   7. If no changes needed, exits quietly
+#
+# If the build triggered by this workflow fails, the commit is NOT auto-reverted
+# — you can either fix manually or revert the commit and the next run will try again.
+
+name: Auto Update Go
+
+on:
+  schedule:
+    # Every Monday 08:00 UTC = 16:00 Beijing time
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      go-version:
+        description: "Override Go version (e.g. 1.26.5). Leave empty for latest stable."
+        required: false
+        type: string
+
+permissions:
+  contents: write       # need write to commit & push
+  actions: write        # need write to trigger downstream workflow
+  packages: write       # need write to push to GHCR
+
+jobs:
+  detect-and-update:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+      go-version: ${{ steps.version.outputs.go_version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Use a PAT or the default GITHUB_TOKEN with write permission.
+          # The default GITHUB_TOKEN works if the workflow has `contents: write`.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Detect latest stable Go version
+        id: version
+        run: |
+          if [ -n "${{ inputs.go-version }}" ]; then
+            GO_VER="${{ inputs.go-version }}"
+          else
+            # Fetch the latest stable Go version from the official API.
+            # The API returns JSON like:
+            # [{"version":"go1.26.5","stable":true,...}, ...]
+            GO_VER=$(curl -fsSL 'https://go.dev/dl?mode=json&include=all' \
+              | jq -r '.[0].version // empty' \
+              | sed 's/^go//')
+            if [ -z "$GO_VER" ]; then
+              echo "Failed to fetch latest Go version from go.dev"
+              exit 1
+            fi
+          fi
+          echo "Detected Go version: $GO_VER"
+          echo "go_version=$GO_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Read current Go version from Dockerfile
+        id: current
+        run: |
+          CURRENT=$(grep -Eo 'FROM golang:[0-9]+\.[0-9]+(\.[0-9]+)?-alpine' Dockerfile \
+            | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+          echo "Current Dockerfile Go version: ${CURRENT:-none}"
+          echo "dockerfile_version=${CURRENT:-none}" >> "$GITHUB_OUTPUT"
+
+      - name: Read current Go version from go.mod
+        id: current-gomod
+        run: |
+          CURRENT_GOMOD=$(grep -Eo '^go [0-9]+\.[0-9]+(\.[0-9]+)?' yyb_go/go.mod \
+            | awk '{print $2}')
+          echo "Current go.mod Go version: ${CURRENT_GOMOD:-none}"
+          echo "gomod_version=${CURRENT_GOMOD:-none}" >> "$GITHUB_OUTPUT"
+
+      # Skip the rest if both are already up to date.
+      - name: Check if update is needed
+        id: check
+        run: |
+          GO_VER="${{ steps.version.outputs.go_version }}"
+          DF_VER="${{ steps.current.outputs.dockerfile_version }}"
+          GM_VER="${{ steps.current-gomod.outputs.gomod_version }}"
+          echo "Target: $GO_VER | Dockerfile: $DF_VER | go.mod: $GM_VER"
+          if [ "$GO_VER" = "$DF_VER" ] && [ "$GO_VER" = "$GM_VER" ]; then
+            echo "Already up to date. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Update files ──────────────────────────────────────────────
+
+      - name: Update Dockerfile
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          GO_VER="${{ steps.version.outputs.go_version }}"
+          # Replace FROM golang:1.xx.x-alpine (or golang:1.xx-alpine) with the new version.
+          # We always pin the full patch version: 1.26.5 (not 1.26) for reproducibility.
+          sed -i -E "s|FROM golang:[0-9]+\.[0-9]+(\.[0-9]+)?-alpine|FROM golang:${GO_VER}-alpine|" Dockerfile
+          echo "--- Updated Dockerfile ---"
+          grep "FROM golang" Dockerfile
+
+      - name: Update go.mod
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          GO_VER="${{ steps.version.outputs.go_version }}"
+          sed -i -E "s|^go [0-9]+\.[0-9]+(\.[0-9]+)?|go ${GO_VER}|" yyb_go/go.mod
+          echo "--- Updated go.mod ---"
+          head -5 yyb_go/go.mod
+
+      - name: Set up Go (for go mod tidy)
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.version.outputs.go_version }}
+          cache-dependency-path: yyb_go/go.sum
+
+      - name: Run go mod tidy
+        if: steps.check.outputs.skip != 'true'
+        working-directory: yyb_go
+        run: |
+          go mod tidy
+          echo "--- go.sum updated ---"
+          echo "go.sum lines: $(wc -l < go.sum)"
+
+      # ── Commit & Push ─────────────────────────────────────────────
+
+      - name: Commit and push changes
+        id: commit
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          GO_VER="${{ steps.version.outputs.go_version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile yyb_go/go.mod yyb_go/go.sum
+          
+          if git diff --cached --quiet; then
+            echo "No actual file changes after update."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            COMMIT_MSG="chore: bump Go to ${GO_VER}"
+            git commit -m "$COMMIT_MSG"
+            git push
+            echo "Pushed commit: $COMMIT_MSG"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Auto Go Update Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Target Go version: \`${{ steps.version.outputs.go_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Dockerfile was: \`${{ steps.current.outputs.dockerfile_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- go.mod was: \`${{ steps.current-gomod.outputs.gomod_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Skip: \`${{ steps.check.outputs.skip }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Changed: \`${{ steps.commit.outputs.changed }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Trigger image build ────────────────────────────────────────────
+  
+  trigger-build:
+    needs: detect-and-update
+    if: needs.detect-and-update.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger docker-build workflow
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const result = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docker-build.yml',
+              ref: context.ref,
+            });
+            console.log('Triggered docker-build.yml:', result.data);
+
+      - name: Notify
+        run: |
+          echo "### Build Triggered" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Go version \`${{ needs.detect-and-update.outputs.go-version }}\` has been committed and the *Build and Push* workflow has been triggered." >> "$GITHUB_STEP_SUMMARY"
+          echo "Check the [Actions tab](https://github.com/${{ github.repository }}/actions) for build status." >> "$GITHUB_STEP_SUMMARY"
