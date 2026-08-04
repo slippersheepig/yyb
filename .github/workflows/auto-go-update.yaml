@@ -4,7 +4,7 @@
 # Also runnable via workflow_dispatch with an optional Go version override.
 #
 # What it does:
-#   1. Fetches the latest stable Go release from go.dev/dl?mode=json
+#   1. Fetches the latest stable Go release from GitHub golang/go releases
 #   2. Updates Dockerfile: FROM golang:<ver>-alpine
 #   3. Updates go.mod:   go <ver>
 #   4. Runs `go mod tidy` to refresh go.sum
@@ -55,16 +55,19 @@ jobs:
           if [ -n "${{ inputs.go-version }}" ]; then
             GO_VER="${{ inputs.go-version }}"
           else
-            # Fetch the latest stable Go version from the official API.
-            # The API returns JSON like:
-            # [{"version":"go1.26.5","stable":true,...}, ...]
-            GO_VER=$(curl -fsSL 'https://go.dev/dl?mode=json&include=all' \
-              | jq -r '.[0].version // empty' \
-              | sed 's/^go//')
-            if [ -z "$GO_VER" ]; then
-              echo "Failed to fetch latest Go version from go.dev"
+            # Fetch the latest stable Go release tag from GitHub API.
+            # The API returns JSON with "tag_name": "go1.26.5" etc.
+            # We strip the leading "go" prefix to get the bare version number.
+            GO_TAG=$(curl -fsSL \
+              -H 'Accept: application/vnd.github+json' \
+              'https://api.github.com/repos/golang/go/releases?per_page=10' \
+              | jq -r '.[] | select(.prerelease == false) | select(.tag_name | startswith("go")) | .tag_name' \
+              | head -1)
+            if [ -z "$GO_TAG" ]; then
+              echo "Failed to fetch latest Go version from GitHub API"
               exit 1
             fi
+            GO_VER="${GO_TAG#go}"
           fi
           echo "Detected Go version: $GO_VER"
           echo "go_version=$GO_VER" >> "$GITHUB_OUTPUT"
@@ -122,7 +125,7 @@ jobs:
 
       - name: Set up Go (for go mod tidy)
         if: steps.check.outputs.skip != 'true'
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.version.outputs.go_version }}
           cache-dependency-path: yyb_go/go.sum
@@ -176,7 +179,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger docker-build workflow
-        uses: actions/github-script@v9
+        uses: actions/github-script@v8
         with:
           script: |
             const result = await github.rest.actions.createWorkflowDispatch({
