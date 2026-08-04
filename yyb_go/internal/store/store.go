@@ -30,9 +30,10 @@ CREATE TABLE IF NOT EXISTS wechat_accounts (
     login_buffer    TEXT    NOT NULL,
     credentials     TEXT,
     status          TEXT,
-    jd_risk_url     TEXT,
+    jd_risk_url      TEXT,
+    jd_risk_expire_at INTEGER,
     jd_cookie        TEXT,
-    last_checked_at INTEGER,
+    last_checked_at   INTEGER,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -110,8 +111,9 @@ type WechatAccount struct {
 	LoginBuffer   string         `json:"login_buffer,omitempty"`
 	Credentials   map[string]any `json:"credentials,omitempty"`
 	Status        *string        `json:"status,omitempty"`
-	JdRiskURL     *string        `json:"jd_risk_url,omitempty"`
-	JdCookie      *string        `json:"jd_cookie,omitempty"`
+	JdRiskURL      *string  `json:"jd_risk_url,omitempty"`
+	JdRiskExpireAt *int64   `json:"jd_risk_expire_at,omitempty"`
+	JdCookie       *string  `json:"jd_cookie,omitempty"`
 	LastCheckedAt *int64         `json:"last_checked_at,omitempty"`
 	CreatedAt     int64          `json:"created_at"`
 	UpdatedAt     int64          `json:"updated_at"`
@@ -125,8 +127,9 @@ type AccountPublic struct {
 	Nickname      *string `json:"nickname"`
 	Avatar        *string `json:"avatar"`
 	Status        *string `json:"status"`
-	JdRiskURL     *string `json:"jd_risk_url,omitempty"`
-	JdCookie      *string `json:"jd_cookie,omitempty"`
+	JdRiskURL      *string `json:"jd_risk_url,omitempty"`
+	JdRiskExpireAt *int64  `json:"jd_risk_expire_at,omitempty"`
+	JdCookie       *string `json:"jd_cookie,omitempty"`
 	LastCheckedAt *int64  `json:"last_checked_at"`
 	CreatedAt     int64   `json:"created_at"`
 	UpdatedAt     int64   `json:"updated_at"`
@@ -202,6 +205,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = migrateSessionsTable(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateJdRiskExpireColumn(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -292,6 +299,26 @@ func (db *DB) EnsureDefaultFeatures(ctx context.Context) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// migrateJdRiskExpireColumn adds the jd_risk_expire_at column to existing wechat_accounts tables
+// that were created before this feature was introduced.
+func migrateJdRiskExpireColumn(ctx context.Context, db *sql.DB) error {
+	var colCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_table_info('wechat_accounts') WHERE name='jd_risk_expire_at'`,
+	).Scan(&colCount); err != nil {
+		return fmt.Errorf("check jd_risk_expire_at column: %w", err)
+	}
+	if colCount > 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `ALTER TABLE wechat_accounts ADD COLUMN jd_risk_expire_at INTEGER`)
+	if err != nil {
+		return fmt.Errorf("add jd_risk_expire_at column: %w", err)
+	}
+	log.Printf("[migration] added jd_risk_expire_at column to wechat_accounts")
 	return nil
 }
 
@@ -483,13 +510,52 @@ func (db *DB) SetAccountStatus(ctx context.Context, id int64, status string) err
 }
 
 // SetJdRiskURL stores or clears the JD risk verification URL for an account.
+// Legacy method without expiry — clears any existing expiry.
 func (db *DB) SetJdRiskURL(ctx context.Context, id int64, riskURL string) error {
 	now := time.Now().Unix()
 	_, err := db.sql.ExecContext(ctx,
-		"UPDATE wechat_accounts SET jd_risk_url=?, updated_at=? WHERE id=?",
+		"UPDATE wechat_accounts SET jd_risk_url=?, jd_risk_expire_at=NULL, updated_at=? WHERE id=?",
 		riskURL, now, id,
 	)
 	return err
+}
+
+// SetJdRiskURLWithExpiry stores the JD risk verification URL with a TTL.
+// After ttl elapses, the URL should be considered expired and not shown to users.
+func (db *DB) SetJdRiskURLWithExpiry(ctx context.Context, id int64, riskURL string, ttl time.Duration) error {
+	now := time.Now().Unix()
+	expireAt := now + int64(ttl.Seconds())
+	_, err := db.sql.ExecContext(ctx,
+		"UPDATE wechat_accounts SET jd_risk_url=?, jd_risk_expire_at=?, updated_at=? WHERE id=?",
+		riskURL, expireAt, now, id,
+	)
+	return err
+}
+
+// GetJdRiskURLIfValid returns the stored risk URL if it hasn't expired.
+// Returns "" if expired or not set.
+func (db *DB) GetJdRiskURLIfValid(ctx context.Context, id int64) (string, error) {
+	var riskURL sql.NullString
+	var expireAt sql.NullInt64
+	err := db.sql.QueryRowContext(ctx,
+		"SELECT jd_risk_url, jd_risk_expire_at FROM wechat_accounts WHERE id=?",
+		id,
+	).Scan(&riskURL, &expireAt)
+	if err != nil {
+		return "", err
+	}
+	if !riskURL.Valid || riskURL.String == "" {
+		return "", nil
+	}
+	// If expire_at is set and past, the URL has expired.
+	if expireAt.Valid {
+		if time.Now().Unix() >= expireAt.Int64 {
+			// Auto-clear expired risk URL.
+			_ = db.SetJdRiskURL(ctx, id, "")
+			return "", nil
+		}
+	}
+	return riskURL.String, nil
 }
 
 // SetJdCookie stores the assembled JD cookie string for an account.
@@ -605,22 +671,23 @@ func (db *DB) GetFeatureByName(ctx context.Context, name string) (*Feature, erro
 
 func (a *WechatAccount) Public() AccountPublic {
 	return AccountPublic{
-		ID:            a.ID,
-		OpenID:        a.OpenID,
-		UIN:           a.UIN,
-		Alias:         a.Alias,
-		Nickname:      a.Nickname,
-		Avatar:        a.Avatar,
-		Status:        a.Status,
-		JdRiskURL:     a.JdRiskURL,
-		JdCookie:      a.JdCookie,
-		LastCheckedAt: a.LastCheckedAt,
-		CreatedAt:     a.CreatedAt,
-		UpdatedAt:     a.UpdatedAt,
+		ID:             a.ID,
+		OpenID:         a.OpenID,
+		UIN:            a.UIN,
+		Alias:          a.Alias,
+		Nickname:       a.Nickname,
+		Avatar:         a.Avatar,
+		Status:         a.Status,
+		JdRiskURL:      a.JdRiskURL,
+		JdRiskExpireAt: a.JdRiskExpireAt,
+		JdCookie:       a.JdCookie,
+		LastCheckedAt:  a.LastCheckedAt,
+		CreatedAt:      a.CreatedAt,
+		UpdatedAt:      a.UpdatedAt,
 	}
 }
 
-const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, jd_risk_url, jd_cookie, last_checked_at, created_at, updated_at FROM wechat_accounts`
+const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, jd_risk_url, jd_risk_expire_at, jd_cookie, last_checked_at, created_at, updated_at FROM wechat_accounts`
 
 type accountScanner interface {
 	Scan(dest ...any) error
@@ -641,11 +708,12 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 		alias, nickname, avatar sql.NullString
 		userJSON, credJSON      sql.NullString
 		status, jdRiskURL       sql.NullString
+		jdRiskExpire           sql.NullInt64
 		jdCookie                sql.NullString
 	)
 	err := row.Scan(
 		&a.ID, &a.OpenID, &uin, &alias, &nickname, &avatar, &userJSON,
-		&a.LoginBuffer, &credJSON, &status, &jdRiskURL, &jdCookie, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
+		&a.LoginBuffer, &credJSON, &status, &jdRiskURL, &jdRiskExpire, &jdCookie, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -658,6 +726,9 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	a.Avatar = stringPtrFromNull(avatar)
 	a.Status = stringPtrFromNull(status)
 	a.JdRiskURL = stringPtrFromNull(jdRiskURL)
+	if jdRiskExpire.Valid {
+		a.JdRiskExpireAt = &jdRiskExpire.Int64
+	}
 	a.JdCookie = stringPtrFromNull(jdCookie)
 	if lastChecked.Valid {
 		a.LastCheckedAt = &lastChecked.Int64
