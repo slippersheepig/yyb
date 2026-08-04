@@ -122,7 +122,7 @@ jobs:
 
       - name: Set up Go (for go mod tidy)
         if: steps.check.outputs.skip != 'true'
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ steps.version.outputs.go_version }}
           cache-dependency-path: yyb_go/go.sum
