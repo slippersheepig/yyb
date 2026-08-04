@@ -19,13 +19,14 @@ import (
 // ── JDCheckResult ──
 
 type JDCheckResult struct {
-	Status   string `json:"status"`
-	Message  string `json:"message,omitempty"`
-	RiskURL  string `json:"risk_url,omitempty"`
-	PTKey    string `json:"pt_key,omitempty"`
-	Pin      string `json:"pt_pin,omitempty"`
-	JdCookie string `json:"jd_cookie,omitempty"`
-	Raw      string `json:"raw,omitempty"`
+	Status       string `json:"status"`
+	Message      string `json:"message,omitempty"`
+	RiskURL      string `json:"risk_url,omitempty"`
+	RiskExpireAt int64  `json:"risk_expire_at,omitempty"`
+	PTKey        string `json:"pt_key,omitempty"`
+	Pin          string `json:"pt_pin,omitempty"`
+	JdCookie     string `json:"jd_cookie,omitempty"`
+	Raw          string `json:"raw,omitempty"`
 }
 
 // 超时常量：login_lt 用 20s，PT exchange 用独立 30s（对应 JDCode.py 的 30s 超时）。
@@ -33,6 +34,10 @@ const jdLoginTimeout = 20 * time.Second
 const jdPTTimeout = 30 * time.Second
 const jdAppID = "wx91d27dbf599dff74"
 const jdLoginLtURL = "https://wq.jd.com/mlogin/wxapp/login_lt"
+
+// riskURLTTL 是京东风险验证链接的前端失效时间。
+// 京东不返回明确的 expire 字段，按行业惯例设置 30 分钟。
+const riskURLTTL = 30 * time.Minute
 const uaWx = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
 	"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 " +
 	"MicroMessenger/8.0.49 NetType/WIFI Language/zh_CN miniProgram/" + jdAppID
@@ -73,11 +78,12 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 
 	// Step 1: Check for risk verification URL.
 	riskURL := extractACRJUrl(jdResp, rawBody)
-	if riskURL != "" && isRiskURL(riskURL) {
+	if riskURL != "" && isRealRiskURL(riskURL) {
 		result.Status = "risk"
 		result.RiskURL = riskURL
+		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
 		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证"
-		_ = a.db.SetJdRiskURL(ctx, acc.ID, riskURL)
+		_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, riskURL, riskURLTTL)
 		return result, nil
 	}
 
@@ -119,12 +125,13 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 			_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 			return result, nil
 		}
-		// If follow failed and URL looks like risk, return as risk.
-		if isRiskURL(acrjURL) {
+		// If follow failed and URL is a real risk URL, return as risk.
+		if isRealRiskURL(acrjURL) {
 			result.Status = "risk"
 			result.RiskURL = acrjURL
+			result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
 			result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证"
-			_ = a.db.SetJdRiskURL(ctx, acc.ID, acrjURL)
+			_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, acrjURL, riskURLTTL)
 			return result, nil
 		}
 	}
@@ -238,7 +245,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 func tryExtractCookie(jdResp map[string]any, cookies []*http.Cookie, rawBody string, jar *cookiejar.Jar, ctx context.Context, acc *store.WechatAccount) string {
 	// Step 1: risk check
 	riskURL := extractACRJUrl(jdResp, rawBody)
-	if riskURL != "" && isRiskURL(riskURL) {
+	if riskURL != "" && isRealRiskURL(riskURL) {
 		return ""
 	}
 
@@ -756,10 +763,61 @@ func resolveURL(base, ref string) string {
 	return ref
 }
 
+// isRealRiskURL 判断一个 URL 是否是真正的京东风险验证链接。
+// 真正的风险验证链接形如：
+//   https://plogin.m.jd.com/h5/risk/select?token=...&client_type=wxapp&guid=...&appid=...&type=wq
+// 排除的是 wqs.jd.com/downloadApp/download.html 这类下载引导页。
+func isRealRiskURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	path := strings.ToLower(parsed.Path)
+
+	// 必须是 jd.com 域名
+	if !strings.HasSuffix(host, "jd.com") {
+		return false
+	}
+
+	// 路径必须包含 /risk/
+	if !strings.Contains(path, "/risk/") {
+		return false
+	}
+
+	// 必须有 token 参数才算有效的风险验证链接
+	q := parsed.Query()
+	if q.Get("token") == "" {
+		return false
+	}
+
+	return true
+}
+
+// isRiskURL is the old broad matcher, kept for backward compatibility in
+// cases where we want to check if a URL is risk-related (even without token).
+// Compared to the original, it now excludes downloadApp/download.html URLs
+// and enforces jd.com domain check.
 func isRiskURL(rawURL string) bool {
-	return strings.Contains(rawURL, "/risk/") ||
-		strings.Contains(rawURL, "risk") ||
-		strings.Contains(rawURL, "verify")
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	path := strings.ToLower(parsed.Path)
+
+	// Exclude downloadApp / download.html — these are NOT risk URLs.
+	if strings.Contains(path, "downloadapp") || strings.Contains(path, "download.html") {
+		return false
+	}
+
+	// Only accept jd.com domains.
+	if !strings.HasSuffix(host, "jd.com") {
+		return false
+	}
+
+	return strings.Contains(path, "/risk/") ||
+		strings.Contains(path, "verify")
 }
 
 // ── ACRJUrl extraction ──
