@@ -160,7 +160,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		result.Status = "risk"
 		result.RiskURL = acrjURL
 		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-		result.Message = "⚠️ 账号需要风险认证，请复制以下链接到浏览器打开，验证通过后再试：\n" + acrjURL
+		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + acrjURL
 		_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, acrjURL, riskURLTTL)
 		return result, nil
 	}
@@ -270,7 +270,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 			result.Status = "risk"
 			result.RiskURL = riskURL
 			result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-			result.Message = "⚠️ 账号需要风险认证，请复制以下链接到浏览器打开，验证通过后再试：\n" + riskURL
+			result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + riskURL
 			_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, riskURL, riskURLTTL)
 			return result, nil
 		}
