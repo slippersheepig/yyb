@@ -147,24 +147,24 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 			_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 			return result, nil
 		}
-		// 如果自动重定向失败，不再做 isRealRiskURL 强校验拦截，而是直接抛出风险认证错误
-		if acrjState != "" && !strings.Contains(acrjURL, "ACRJState=") {
-			parsed, err := url.Parse(acrjURL)
-			if err == nil {
-				q := parsed.Query()
-				q.Set("ACRJState", acrjState)
-				parsed.RawQuery = q.Encode()
-				acrjURL = parsed.String()
+		if isRiskURL(acrjURL) {
+			if acrjState != "" && !strings.Contains(acrjURL, "ACRJState=") {
+				parsed, err := url.Parse(acrjURL)
+				if err == nil {
+					q := parsed.Query()
+					q.Set("ACRJState", acrjState)
+					parsed.RawQuery = q.Encode()
+					acrjURL = parsed.String()
+				}
 			}
+			result.Status = "risk"
+			result.RiskURL = acrjURL
+			result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+			result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + acrjURL
+			_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, acrjURL, riskURLTTL)
+			return result, nil
 		}
-		result.Status = "risk"
-		result.RiskURL = acrjURL
-		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + acrjURL
-		_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, acrjURL, riskURLTTL)
-		return result, nil
 	}
-
 	// Step 5: Try sfsRefreshToken — JD often returns sfstoken+pin but no pt_key.
 	sfsCk := sfsExchangePtKey(ctx, cookies, jar)
 	if sfsCk != "" {
@@ -257,7 +257,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		acrjStateCheck := extractACRJState(jdResp, rawBody)
 
 		// 不再使用 isRealRiskURL 强制拦截，直接抛出风控认证链接
-		if riskURL != "" {
+		if riskURL != "" && isRiskURL(riskURL) {
 			if acrjStateCheck != "" && !strings.Contains(riskURL, "ACRJState=") {
 				parsed, err := url.Parse(riskURL)
 				if err == nil {
