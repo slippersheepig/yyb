@@ -136,7 +136,6 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 
 	// Step 4: Follow server-side refresh redirect chain (matching JDCode.py).
 	acrjURL := extractACRJUrl(jdResp, rawBody)
-	acrjState := extractACRJState(jdResp, rawBody)
 	if acrjURL != "" {
 		refreshCk, err := followServerRefresh(ctx, acrjURL, acrjState, jar)
 		if err == nil && refreshCk != "" {
