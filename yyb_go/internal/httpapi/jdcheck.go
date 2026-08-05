@@ -58,8 +58,19 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 
 	codeResult, err := a.pool.GetCode(ctx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
 	if err != nil {
-		return JDCheckResult{Status: "error", Message: "获取小程序 code 失败: " + err.Error()}, err
+		// session 可能过期了，失效旧的 + 刷新账号 + 重试一次
+		_ = a.pool.Invalidate(ctx, acc.ID, a.cfg.TCPProxy)
+		if a.refreshLiveness(ctx, acc) == "alive" {
+			if fresh, e := a.db.GetAccount(ctx, acc.ID); e == nil && fresh != nil {
+				acc = fresh
+			}
+			codeResult, err = a.pool.GetCode(ctx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
+		}
+		if err != nil {
+			return JDCheckResult{Status: "error", Message: "获取小程序 code 失败: " + err.Error()}, err
+		}
 	}
+
 	code, ok := codeResult["code"].(string)
 	if !ok || code == "" {
 		return JDCheckResult{Status: "error", Message: "小程序 code 为空"}, fmt.Errorf("empty code")
