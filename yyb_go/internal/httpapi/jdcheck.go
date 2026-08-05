@@ -89,6 +89,18 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 
 	// Step 1: Check for risk verification URL.
 	riskURL := extractACRJUrl(jdResp, rawBody)
+	acrjState := extractACRJState(jdResp, rawBody)
+	riskFlwType := extractRiskFlwType(jdResp, rawBody)
+
+	if riskURL != "" {
+		log.Printf(
+			"[JD风险认证] ACRJUrl=%s ACRJState=%s RiskFlwType=%d",
+			riskURL,
+			acrjState,
+			riskFlwType,
+		)
+	}
+
 	if riskURL != "" && isRealRiskURL(riskURL) {
 		result.Status = "risk"
 		result.RiskURL = riskURL
@@ -235,10 +247,29 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		strVal(jdResp, "errmsg"), strVal(jdResp, "errMsg"),
 	)
 	if strings.Contains(strings.ToUpper(retMsg), "SUCCESS") {
-		// Don't fake success — if no CK was captured, report error.
+		riskURL := extractACRJUrl(jdResp, rawBody)
+		if riskURL != "" && isRealRiskURL(riskURL) {
+			result.Status = "risk"
+			result.RiskURL = riskURL
+			result.RiskExpireAt =
+				time.Now().Add(riskURLTTL).Unix()
+			result.Message =
+				"京东需要安全验证，请完成认证后重新验证"
+			_ = a.db.SetJdRiskURLWithExpiry(
+				ctx,
+				acc.ID,
+				riskURL,
+				riskURLTTL,
+			)
+			return result, nil
+		}
+
 		result.Status = "error"
-		result.Message = "京东返回成功但未捕获到Cookie，请重新验证"
-		return result, fmt.Errorf("SUCCESS but no pt_key/pt_pin captured")
+		result.Message =
+			"京东返回成功但未捕获到Cookie，请重新验证"
+		return result, fmt.Errorf(
+			"SUCCESS but no pt_key/pt_pin captured",
+		)
 	}
 
 	result.Status = "error"
@@ -898,6 +929,28 @@ func extractACRJState(jdResp map[string]any, rawBody string) string {
 		}
 	}
 	return ""
+}
+
+func extractRiskFlwType(resp map[string]any, raw string) int {
+	if info, ok := resp["info"].(map[string]any); ok {
+		switch v := info["RiskFlwType"].(type) {
+		case float64:
+			return int(v)
+		case int:
+			return v
+		}
+	}
+
+	// 兜底：正则匹配
+	re := regexp.MustCompile(`"RiskFlwType"\s*:\s*(\d+)`)
+	m := re.FindStringSubmatch(raw)
+
+	if len(m) == 2 {
+		var n int
+		fmt.Sscanf(m[1], "%d", &n)
+		return n
+	}
+	return 0
 }
 
 func searchRawBodyForRiskUrl(rawBody string) string {
