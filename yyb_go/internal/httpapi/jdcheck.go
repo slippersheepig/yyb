@@ -211,14 +211,34 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 				fullResp, fullCookies, fullRaw, fullJar, _, flErr := callLoginLt(ctx, fullCode, userInfo)
 				if flErr == nil {
 					// 重复 Step 1-5 with full params。
-					fullCk := tryExtractCookie(fullResp, fullCookies, fullRaw, fullJar, ctx, acc)
-					if fullCk != "" {
+					fullResult := tryExtractCookie(fullResp, fullCookies, fullRaw, fullJar, ctx, acc)
+					if fullResult.Cookie != "" {
 						result.Status = "ok"
-						result.PTKey = parseCookieValue(fullCk, "pt_key")
-						result.Pin = parseCookieValue(fullCk, "pt_pin")
+						result.PTKey = parseCookieValue(fullResult.Cookie, "pt_key")
+						result.Pin = parseCookieValue(fullResult.Cookie, "pt_pin")
 						result.Message = "京东登录成功（full mode）"
-						result.JdCookie = fullCk
+						result.JdCookie = fullResult.Cookie
 						_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+						return result, nil
+					}
+					// full mode 也检测到了 risk URL — 返回给用户。
+					if fullResult.RiskURL != "" {
+						riskURL := fullResult.RiskURL
+						acrjStateFull := extractACRJState(fullResp, fullRaw)
+						if acrjStateFull != "" && !strings.Contains(riskURL, "ACRJState=") {
+							parsed, err := url.Parse(riskURL)
+							if err == nil {
+								q := parsed.Query()
+								q.Set("ACRJState", acrjStateFull)
+								parsed.RawQuery = q.Encode()
+								riskURL = parsed.String()
+							}
+						}
+						result.Status = "risk"
+						result.RiskURL = riskURL
+						result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+						result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + riskURL
+						_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, riskURL, riskURLTTL)
 						return result, nil
 					}
 
@@ -246,41 +266,42 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		}
 	}
 
-	// Step 6: Check retMsg for SUCCESS — but only trust if we actually got CK.
+	// Step 6: Final fallback — check for ACRJUrl regardless of retMsg.
+	// Python 脚本不管 retMsg 内容，只要有 ACRJUrl 就把它展示给用户。
+	// Go 端之前只在 retMsg 含 SUCCESS 时才检查 ACRJUrl，导致风险链接被丢弃。
 	retMsg := firstNonEmpty(
 		strVal(jdResp, "retMsg"), strVal(jdResp, "retmsg"),
 		strVal(jdResp, "msg"), strVal(jdResp, "message"),
 		strVal(jdResp, "errmsg"), strVal(jdResp, "errMsg"),
 	)
-	if strings.Contains(strings.ToUpper(retMsg), "SUCCESS") {
-		riskURL := extractACRJUrl(jdResp, rawBody)
+
+	// 不管 retMsg 是什么，只要有 ACRJUrl 就返回给用户。
+	finalRiskURL := extractACRJUrl(jdResp, rawBody)
+	if finalRiskURL != "" {
 		acrjStateCheck := extractACRJState(jdResp, rawBody)
-
-		// 不再使用 isRealRiskURL 强制拦截，直接抛出风控认证链接
-		if riskURL != "" && isRiskURL(riskURL) {
-			if acrjStateCheck != "" && !strings.Contains(riskURL, "ACRJState=") {
-				parsed, err := url.Parse(riskURL)
-				if err == nil {
-					q := parsed.Query()
-					q.Set("ACRJState", acrjStateCheck)
-					parsed.RawQuery = q.Encode()
-					riskURL = parsed.String()
-				}
+		if acrjStateCheck != "" && !strings.Contains(finalRiskURL, "ACRJState=") {
+			parsed, err := url.Parse(finalRiskURL)
+			if err == nil {
+				q := parsed.Query()
+				q.Set("ACRJState", acrjStateCheck)
+				parsed.RawQuery = q.Encode()
+				finalRiskURL = parsed.String()
 			}
-			result.Status = "risk"
-			result.RiskURL = riskURL
-			result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-			result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + riskURL
-			_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, riskURL, riskURLTTL)
-			return result, nil
 		}
+		result.Status = "risk"
+		result.RiskURL = finalRiskURL
+		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + finalRiskURL
+		_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, finalRiskURL, riskURLTTL)
+		return result, nil
+	}
 
-		result.Status = "error"
+	// 真正没有任何可用信息时才报错。
+	result.Status = "error"
+	if strings.Contains(strings.ToUpper(retMsg), "SUCCESS") {
 		result.Message = "京东返回成功但未捕获到Cookie，请重新验证"
 		return result, fmt.Errorf("SUCCESS but no pt_key/pt_pin captured")
 	}
-
-	result.Status = "error"
 	if retMsg != "" {
 		result.Message = "京东登录失败: " + retMsg
 	} else {
@@ -292,23 +313,36 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 // ── tryExtractCookie runs Steps 1-5 on a given login_lt response, returning
 // the first pt_key/pt_pin cookie found, or "" if all steps fail. ──
 
-func tryExtractCookie(jdResp map[string]any, cookies []*http.Cookie, rawBody string, jar *cookiejar.Jar, ctx context.Context, acc *store.WechatAccount) string {
-	// Step 1: risk check
+// tryExtractCookieResult holds the result of a full-mode cookie extraction attempt.
+// If Cookie != "", login succeeded. If RiskURL != "", a risk verification URL
+// was found but no cookie — the caller must surface it to the user.
+type tryExtractCookieResult struct {
+	Cookie  string
+	RiskURL string
+}
+
+func tryExtractCookie(jdResp map[string]any, cookies []*http.Cookie, rawBody string, jar *cookiejar.Jar, ctx context.Context, acc *store.WechatAccount) tryExtractCookieResult {
+	result := tryExtractCookieResult{}
+
+	// Step 1: risk check — capture the risk URL instead of swallowing it.
 	riskURL := extractACRJUrl(jdResp, rawBody)
 	if riskURL != "" && isRealRiskURL(riskURL) {
-		return ""
+		result.RiskURL = riskURL
+		return result
 	}
 
 	// Step 2: cookie jar
 	ck := extractPtCookie(cookies)
 	if ck != "" {
-		return ck
+		result.Cookie = ck
+		return result
 	}
 
 	// Step 3: response body
 	bodyCk := extractPtCookieFromBody(jdResp)
 	if bodyCk != "" {
-		return bodyCk
+		result.Cookie = bodyCk
+		return result
 	}
 
 	// Step 4: ACRJUrl refresh chain
@@ -317,17 +351,24 @@ func tryExtractCookie(jdResp map[string]any, cookies []*http.Cookie, rawBody str
 	if acrjURL != "" {
 		refreshCk, err := followServerRefresh(ctx, acrjURL, acrjState, jar)
 		if err == nil && refreshCk != "" {
-			return refreshCk
+			result.Cookie = refreshCk
+			return result
+		}
+		// follow_server_refresh failed — if this is a risk URL, preserve it.
+		if isRiskURL(acrjURL) {
+			result.RiskURL = acrjURL
+			return result
 		}
 	}
 
 	// Step 5: sfsRefreshToken
 	sfsCk := sfsExchangePtKey(ctx, cookies, jar)
 	if sfsCk != "" {
-		return sfsCk
+		result.Cookie = sfsCk
+		return result
 	}
 
-	return ""
+	return result
 }
 
 // ── getUserInfo (matching JDCode.py get_yyb_user_info) ──
