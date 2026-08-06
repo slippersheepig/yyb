@@ -101,7 +101,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		)
 	}
 
-	if riskURL != "" && isRealRiskURL(riskURL) {
+	if riskURL != "" && isRiskURL(riskURL) {
 		result.Status = "risk"
 		result.RiskURL = riskURL
 		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
@@ -326,7 +326,7 @@ func tryExtractCookie(jdResp map[string]any, cookies []*http.Cookie, rawBody str
 
 	// Step 1: risk check — capture the risk URL instead of swallowing it.
 	riskURL := extractACRJUrl(jdResp, rawBody)
-	if riskURL != "" && isRealRiskURL(riskURL) {
+	if riskURL != "" && isRiskURL(riskURL) {
 		result.RiskURL = riskURL
 		return result
 	}
@@ -852,37 +852,6 @@ func resolveURL(base, ref string) string {
 		return resolved.String()
 	}
 	return ref
-}
-
-// isRealRiskURL 判断一个 URL 是否是真正的京东风险验证链接。
-// 真正的风险验证链接形如：
-//   https://plogin.m.jd.com/h5/risk/select?token=...&client_type=wxapp&guid=...&appid=...&type=wq
-// 排除的是 wqs.jd.com/downloadApp/download.html 这类下载引导页。
-func isRealRiskURL(rawURL string) bool {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(parsed.Hostname())
-	path := strings.ToLower(parsed.Path)
-
-	// 必须是 jd.com 域名
-	if !strings.HasSuffix(host, "jd.com") {
-		return false
-	}
-
-	// 路径必须包含 /risk/
-	if !strings.Contains(path, "/risk/") {
-		return false
-	}
-
-	// 必须有 token 参数才算有效的风险验证链接
-	q := parsed.Query()
-	if q.Get("token") == "" {
-		return false
-	}
-
-	return true
 }
 
 // isRiskURL is the old broad matcher, kept for backward compatibility in
