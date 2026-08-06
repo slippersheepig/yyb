@@ -87,6 +87,16 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	}
 	result := JDCheckResult{Raw: rawStr}
 
+	// lastJdResp/lastRawBody 跟踪"最近一次"京东响应，供 Step 6 兜底检查使用。
+	// 如果后面 full mode（Phase 2）发起了新请求，这两个变量会被更新为 full mode 的响应；
+	// 否则保持 code-only（Phase 1）的响应。
+	// 之前的 bug：Step 6 一直只检查最初 code-only 的 jdResp/rawBody，
+	// full mode 拿到的新响应（很可能才是真正带 ACRJUrl 的那个）被完全忽略，
+	// 导致风险认证链接丢失，最终误报「京东返回成功但未捕获到Cookie」。
+	lastJdResp := jdResp
+	lastRawBody := rawBody
+	fullModeRan := false
+
 	// Step 1: Check for risk verification URL.
 	riskURL := extractACRJUrl(jdResp, rawBody)
 	acrjState := extractACRJState(jdResp, rawBody)
@@ -210,6 +220,12 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 			if fullCode, ok := fullCodeResult["code"].(string); ok && fullCode != "" {
 				fullResp, fullCookies, fullRaw, fullJar, _, flErr := callLoginLt(ctx, fullCode, userInfo)
 				if flErr == nil {
+					// full mode 发起了新请求并拿到了响应，Step 6 兜底检查应该用这份最新的，
+					// 而不是继续用最初 code-only 的旧响应。
+					lastJdResp = fullResp
+					lastRawBody = fullRaw
+					fullModeRan = true
+
 					// 重复 Step 1-5 with full params。
 					fullResult := tryExtractCookie(fullResp, fullCookies, fullRaw, fullJar, ctx, acc)
 					if fullResult.Cookie != "" {
@@ -269,16 +285,26 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	// Step 6: Final fallback — check for ACRJUrl regardless of retMsg.
 	// Python 脚本不管 retMsg 内容，只要有 ACRJUrl 就把它展示给用户。
 	// Go 端之前只在 retMsg 含 SUCCESS 时才检查 ACRJUrl，导致风险链接被丢弃。
+	//
+	// 修复：优先检查"最近一次"响应（full mode 跑过就是 full mode 的响应，
+	// 否则是 code-only 的响应）；如果最近一次没有 ACRJUrl，再退回去检查最初
+	// code-only 的响应，双保险，避免任何一侧的风险链接被漏掉。
 	retMsg := firstNonEmpty(
-		strVal(jdResp, "retMsg"), strVal(jdResp, "retmsg"),
-		strVal(jdResp, "msg"), strVal(jdResp, "message"),
-		strVal(jdResp, "errmsg"), strVal(jdResp, "errMsg"),
+		strVal(lastJdResp, "retMsg"), strVal(lastJdResp, "retmsg"),
+		strVal(lastJdResp, "msg"), strVal(lastJdResp, "message"),
+		strVal(lastJdResp, "errmsg"), strVal(lastJdResp, "errMsg"),
 	)
 
 	// 不管 retMsg 是什么，只要有 ACRJUrl 就返回给用户。
-	finalRiskURL := extractACRJUrl(jdResp, rawBody)
+	finalRiskURL := extractACRJUrl(lastJdResp, lastRawBody)
+	finalRiskJdResp, finalRiskRawBody := lastJdResp, lastRawBody
+	if finalRiskURL == "" && fullModeRan {
+		// 最近一次（full mode）响应没有风险链接，回退检查最初 code-only 响应。
+		finalRiskURL = extractACRJUrl(jdResp, rawBody)
+		finalRiskJdResp, finalRiskRawBody = jdResp, rawBody
+	}
 	if finalRiskURL != "" {
-		acrjStateCheck := extractACRJState(jdResp, rawBody)
+		acrjStateCheck := extractACRJState(finalRiskJdResp, finalRiskRawBody)
 		if acrjStateCheck != "" && !strings.Contains(finalRiskURL, "ACRJState=") {
 			parsed, err := url.Parse(finalRiskURL)
 			if err == nil {
@@ -297,6 +323,17 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	}
 
 	// 真正没有任何可用信息时才报错。
+	// 把最近一次的原始响应打到服务端日志里，方便排查（对应 JDCode.py 在失败时
+	// 把 payload_fields / jar_fields / raw_payload_snippet 一起打印出来的做法，
+	// Go 端之前完全没有落这份日志，出问题时只能靠猜）。
+	logRaw := lastRawBody
+	if len(logRaw) > 800 {
+		logRaw = logRaw[:800]
+	}
+	log.Printf(
+		"[JD验证-未捕获Cookie] account=%d retMsg=%q lastRaw=%s",
+		acc.ID, retMsg, logRaw,
+	)
 	result.Status = "error"
 	if strings.Contains(strings.ToUpper(retMsg), "SUCCESS") {
 		result.Message = "京东返回成功但未捕获到Cookie，请重新验证"
@@ -307,7 +344,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	} else {
 		result.Message = "京东返回了未知响应"
 	}
-	return result, fmt.Errorf("unknown JD response: retCode=%v retMsg=%s", jdResp["retCode"], retMsg)
+	return result, fmt.Errorf("unknown JD response: retCode=%v retMsg=%s", lastJdResp["retCode"], retMsg)
 }
 
 // ── tryExtractCookie runs Steps 1-5 on a given login_lt response, returning
