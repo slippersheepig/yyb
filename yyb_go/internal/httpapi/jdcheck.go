@@ -176,14 +176,23 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		}
 	}
 	// Step 5: Try sfsRefreshToken — JD often returns sfstoken+pin but no pt_key.
-	sfsCk := sfsExchangePtKey(ctx, cookies, jar)
-	if sfsCk != "" {
+	sfsRes := sfsExchangePtKey(ctx, cookies, jar)
+	if sfsRes.Cookie != "" {
 		result.Status = "ok"
-		result.PTKey = parseCookieValue(sfsCk, "pt_key")
-		result.Pin = parseCookieValue(sfsCk, "pt_pin")
+		result.PTKey = parseCookieValue(sfsRes.Cookie, "pt_key")
+		result.Pin = parseCookieValue(sfsRes.Cookie, "pt_pin")
 		result.Message = "京东登录成功"
-		result.JdCookie = sfsCk
+		result.JdCookie = sfsRes.Cookie
 		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		return result, nil
+	}
+	// SFS exchange returned a risk URL — surface it to the user.
+	if sfsRes.RiskURL != "" {
+		result.Status = "risk"
+		result.RiskURL = sfsRes.RiskURL
+		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + sfsRes.RiskURL
+		_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, sfsRes.RiskURL, riskURLTTL)
 		return result, nil
 	}
 
@@ -322,6 +331,92 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		return result, nil
 	}
 
+	// Step 6.5: Last-resort retry — JD sometimes returns SUCCESS with empty ACRJUrl
+	// on the first attempt but returns a risk URL on a fresh code retry.
+	// This matches JDCode.py's auto mode behavior where code-only fails → retry.
+	if finalRiskURL == "" && strings.Contains(strings.ToUpper(retMsg), "SUCCESS") {
+		log.Printf("[JD验证] SUCCESS但无cookie无ACRJUrl，尝试最后一次重试")
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), jdLoginTimeout+5*time.Second)
+		defer retryCancel()
+		retryCode, retryErr := a.pool.GetCode(retryCtx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
+		if retryErr == nil && retryCode != nil {
+			if retryCodeVal, ok := retryCode["code"].(string); ok && retryCodeVal != "" {
+				rResp, rCookies, rRaw, rJar, _, rErr := callLoginLt(retryCtx, retryCodeVal, nil)
+				if rErr == nil {
+					// Check risk URL first.
+					rRiskURL := extractACRJUrl(rResp, rRaw)
+					rAcrjState := extractACRJState(rResp, rRaw)
+					if rRiskURL != "" && isRiskURL(rRiskURL) {
+						if rAcrjState != "" && !strings.Contains(rRiskURL, "ACRJState=") {
+							if parsed, e := url.Parse(rRiskURL); e == nil {
+								q := parsed.Query()
+								q.Set("ACRJState", rAcrjState)
+								parsed.RawQuery = q.Encode()
+								rRiskURL = parsed.String()
+							}
+						}
+						log.Printf("[JD验证-重试] 重试获得风险链接: %s", rRiskURL)
+						result.Status = "risk"
+						result.RiskURL = rRiskURL
+						result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+						result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + rRiskURL
+						_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, rRiskURL, riskURLTTL)
+						return result, nil
+					}
+					// Check cookie.
+					rCk := extractPtCookie(rCookies)
+					if rCk == "" {
+						rCk = extractPtCookieFromBody(rResp)
+					}
+					if rCk == "" {
+						rCk = parseCookieFromRaw(rRaw)
+					}
+					if rCk != "" {
+						log.Printf("[JD验证-重试] 重试获得cookie成功")
+						result.Status = "ok"
+						result.PTKey = parseCookieValue(rCk, "pt_key")
+						result.Pin = parseCookieValue(rCk, "pt_pin")
+						result.Message = "京东登录成功（重试）"
+						result.JdCookie = rCk
+						_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+						return result, nil
+					}
+					// Check ACRJUrl refresh chain.
+					if rRiskURL != "" {
+						rRefreshCk, rErr := followServerRefresh(retryCtx, rRiskURL, rAcrjState, rJar)
+						if rErr == nil && rRefreshCk != "" {
+							log.Printf("[JD验证-重试] 重试refresh链获得cookie")
+							result.Status = "ok"
+							result.PTKey = parseCookieValue(rRefreshCk, "pt_key")
+							result.Pin = parseCookieValue(rRefreshCk, "pt_pin")
+							result.Message = "京东登录成功（重试）"
+							result.JdCookie = rRefreshCk
+							_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+							return result, nil
+						}
+						if isRiskURL(rRiskURL) {
+							result.Status = "risk"
+							result.RiskURL = rRiskURL
+							result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+							result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + rRiskURL
+							_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, rRiskURL, riskURLTTL)
+							return result, nil
+						}
+					}
+					// Retry also returned SUCCESS with no useful info — update lastJdResp for the log.
+					lastJdResp = rResp
+					lastRawBody = rRaw
+					retMsg = firstNonEmpty(
+						strVal(rResp, "retMsg"), strVal(rResp, "retmsg"),
+						strVal(rResp, "msg"), strVal(rResp, "message"),
+						strVal(rResp, "errmsg"), strVal(rResp, "errMsg"),
+					)
+					log.Printf("[JD验证-重试] 重试仍未获得cookie或风险链接")
+				}
+			}
+		}
+	}
+
 	// 真正没有任何可用信息时才报错。
 	// 把最近一次的原始响应打到服务端日志里，方便排查（对应 JDCode.py 在失败时
 	// 把 payload_fields / jar_fields / raw_payload_snippet 一起打印出来的做法，
@@ -399,9 +494,13 @@ func tryExtractCookie(jdResp map[string]any, cookies []*http.Cookie, rawBody str
 	}
 
 	// Step 5: sfsRefreshToken
-	sfsCk := sfsExchangePtKey(ctx, cookies, jar)
-	if sfsCk != "" {
-		result.Cookie = sfsCk
+	sfsRes := sfsExchangePtKey(ctx, cookies, jar)
+	if sfsRes.Cookie != "" {
+		result.Cookie = sfsRes.Cookie
+		return result
+	}
+	if sfsRes.RiskURL != "" {
+		result.RiskURL = sfsRes.RiskURL
 		return result
 	}
 
@@ -676,11 +775,20 @@ func followServerRefresh(ctx context.Context, acrjURL, acrjState string, jar *co
 // JD often returns sfstoken+pin cookies but no pt_key; this extra call is needed.
 const jdSfsRefreshURL = "https://wq.jd.com/mlogin/wxapp/sfsRefreshToken"
 
-func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookiejar.Jar) string {
+// sfsExchangeResult holds the result of an SFS token exchange attempt.
+// If Cookie != "", login succeeded. If RiskURL != "", a risk verification URL
+// was found but no cookie — the caller must surface it to the user.
+type sfsExchangeResult struct {
+	Cookie  string
+	RiskURL string
+}
+
+func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookiejar.Jar) sfsExchangeResult {
+	var res sfsExchangeResult
 	sfs := cookieValue(cookies, "sfstoken")
 	pin := cookieValue(cookies, "pin", "pt_pin")
 	if sfs == "" || pin == "" {
-		return ""
+		return res
 	}
 
 	ctx2, cancel := context.WithTimeout(ctx, jdLoginTimeout)
@@ -699,7 +807,7 @@ func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookieja
 	reqURL := jdSfsRefreshURL + "?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx2, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return ""
+		return res
 	}
 	req.Header.Set("User-Agent", uaWx)
 	req.Header.Set("Referer", "https://servicewechat.com/"+jdAppID+"/873/page-frame.html")
@@ -715,7 +823,7 @@ func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookieja
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return ""
+		return res
 	}
 	defer resp.Body.Close()
 
@@ -726,7 +834,8 @@ func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookieja
 	allCk = append(allCk, resp.Cookies()...)
 	ck := extractPtCookie(allCk)
 	if ck != "" {
-		return ck
+		res.Cookie = ck
+		return res
 	}
 
 	// 2. Check response body JSON for pt_key/pt_pin.
@@ -734,20 +843,29 @@ func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookieja
 	if json.Unmarshal(body, &sfsResp) == nil {
 		bodyCk := extractPtCookieFromBody(sfsResp)
 		if bodyCk != "" {
-			return bodyCk
+			res.Cookie = bodyCk
+			return res
 		}
 		// 3. Check raw body for cookie pattern.
 		rawCk := parseCookieFromRaw(string(body))
 		if rawCk != "" {
-			return rawCk
+			res.Cookie = rawCk
+			return res
 		}
 		// 4. SFS response may contain a new ACRJUrl — follow it.
 		acrjURL := extractACRJUrl(sfsResp, string(body))
 		acrjState := extractACRJState(sfsResp, string(body))
 		if acrjURL != "" {
+			if isRiskURL(acrjURL) {
+				res.RiskURL = acrjURL
+			}
 			refreshCk, err := followServerRefresh(ctx, acrjURL, acrjState, jar)
 			if err == nil && refreshCk != "" {
-				return refreshCk
+				res.Cookie = refreshCk
+				return res
+			}
+			if res.RiskURL != "" {
+				return res
 			}
 		}
 	}
@@ -755,10 +873,19 @@ func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookieja
 	// 5. Fallback: check raw body.
 	rawCk := parseCookieFromRaw(string(body))
 	if rawCk != "" {
-		return rawCk
+		res.Cookie = rawCk
+		return res
 	}
 
-	return ""
+	log.Printf("[SFS交换] 未获得pt_key; pin=%s sfstoken前缀=%s", pin, truncateForLog(sfs, 20))
+	return res
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // ── cookie helpers ──
