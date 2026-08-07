@@ -196,6 +196,16 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		return result, nil
 	}
 
+	// SFS exchange returned nothing — JD server-side state sync has latency.
+	// Wait 3 seconds before retrying so JD risk control state can settle.
+	if sfsRes.Cookie == "" && sfsRes.RiskURL == "" {
+		log.Printf("[JD验证] SFS交换失败，等待3秒后重试login_lt（等待JD服务端状态同步）")
+		select {
+		case <-time.After(3 * time.Second):
+		case <-ctx.Done():
+		}
+	}
+
 	// Step 5.1: Post-SFS retry — SFS exchange failure often triggers JD's risk
 	// control state internally. A fresh code-only login_lt at this point
 	// frequently returns the ACRJUrl that was missing in the first attempt.
@@ -772,10 +782,59 @@ type sfsExchangeResult struct {
 	RiskURL string
 }
 
+// sfsAndPinFromJar queries multiple JD domains from the cookie jar to find
+// sfstoken and pin/pt_pin cookies that may have been set with Domain=.jd.com
+// and thus missed by a single-domain jar.Cookies() call.
+func sfsAndPinFromJar(jar *cookiejar.Jar) (string, string) {
+	if jar == nil {
+		return "", ""
+	}
+	domains := []string{
+		"https://jd.com/",
+		"https://wq.jd.com/",
+		"https://plogin.m.jd.com/",
+	}
+	var sfs, pin string
+	for _, d := range domains {
+		u, err := url.Parse(d)
+		if err != nil {
+			continue
+		}
+		for _, c := range jar.Cookies(u) {
+			switch c.Name {
+			case "sfstoken":
+				if sfs == "" {
+					sfs = c.Value
+				}
+			case "pin", "pt_pin":
+				if pin == "" {
+					pin = c.Value
+				}
+			}
+		}
+		if sfs != "" && pin != "" {
+			break
+		}
+	}
+	return sfs, pin
+}
+
 func sfsExchangePtKey(ctx context.Context, cookies []*http.Cookie, jar *cookiejar.Jar) sfsExchangeResult {
 	var res sfsExchangeResult
 	sfs := cookieValue(cookies, "sfstoken")
 	pin := cookieValue(cookies, "pin", "pt_pin")
+	// Fallback: cookies snapshot only captures wq.jd.com domain cookies.
+	// JD Set-Cookie may carry Domain=.jd.com, which jar.Cookies(wq.jd.com) misses.
+	// Query multiple JD domains from the jar to recover sfstoken/pin.
+	if sfs == "" || pin == "" {
+		jarSfs, jarPin := sfsAndPinFromJar(jar)
+		if sfs == "" {
+			sfs = jarSfs
+		}
+		if pin == "" {
+			pin = jarPin
+		}
+	}
 	if sfs == "" || pin == "" {
 		return res
 	}
