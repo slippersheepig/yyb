@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -276,6 +277,7 @@ func credentialsFromJar(jar http.CookieJar, rawURL string) (protocol.LoginBuffer
 	if openid == "" || accessToken == "" {
 		return protocol.LoginBufferCredentials{}, fmt.Errorf("OAuth callback did not set required cookies")
 	}
+	log.Printf("[OAuth回调] openid=%s refreshtoken为空=%v expires_in=%s", openid, values["refreshtoken"] == "", values["expires_in"])
 	expiresIn := int64(7200)
 	if values["expires_in"] != "" {
 		if n, err := strconv.ParseInt(values["expires_in"], 10, 64); err == nil && n > 0 {
