@@ -838,6 +838,7 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 	creds := protocol.CredentialsFromMap(acc.Credentials)
 	result, err := a.qr.RefreshLoginBuffer(ctx, creds)
 	if err != nil {
+		log.Printf("[会话刷新失败] account=%d openid=%s refreshtoken为空=%v err=%v", acc.ID, acc.OpenID, creds.RefreshToken == "", err)
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
 		return "expired"
 	}
