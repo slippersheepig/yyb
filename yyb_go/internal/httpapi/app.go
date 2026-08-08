@@ -107,7 +107,7 @@ func NewApp(cfg Config) (*App, error) {
 		pool:       pool,
 		qr:         qr.NewClient(cfg.RequestTimeout),
 		qrSessions: map[string]*qr.Session{},
-		webAuth:   webAuth,
+		webAuth:    webAuth,
 	}, nil
 }
 
@@ -203,95 +203,95 @@ func (a *App) DB() *store.DB { return a.db }
 func (a *App) SetTelegramBot(bot *tgbot.Bot) { a.tgBot = bot }
 
 func (a *App) Handler() http.Handler {
-    if os.Getenv(gin.EnvGinMode) == "" {
-        gin.SetMode(gin.ReleaseMode)
-    }
+	if os.Getenv(gin.EnvGinMode) == "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
-    router := gin.New()
-    router.Use(gin.Logger(), gin.Recovery())
+	router := gin.New()
+	router.Use(gin.Logger(), gin.Recovery())
 
-    // ── 公开路由（无需鉴权）──
-    router.Any("/", gin.WrapF(a.handleIndex))
-    router.Any("/scan", gin.WrapF(a.handleScan))
-    router.Any("/login", gin.WrapF(a.handleLogin))
-    router.Any("/logout", gin.WrapF(a.handleLogout))
-    router.Any("/health", func(c *gin.Context) {
-        writeJSON(c.Writer, http.StatusOK, gin.H{"ok": true})
-    })
-    router.StaticFS("/static", http.Dir(a.resources.Static))
-    router.Any("/qr", gin.WrapF(a.handleQRRoot))
-    router.Any("/qr/*path", gin.WrapF(a.handleQR))
+	// ── 公开路由（无需鉴权）──
+	router.Any("/", gin.WrapF(a.handleIndex))
+	router.Any("/scan", gin.WrapF(a.handleScan))
+	router.Any("/login", gin.WrapF(a.handleLogin))
+	router.Any("/logout", gin.WrapF(a.handleLogout))
+	router.Any("/health", func(c *gin.Context) {
+		writeJSON(c.Writer, http.StatusOK, gin.H{"ok": true})
+	})
+	router.StaticFS("/static", http.Dir(a.resources.Static))
+	router.Any("/qr", gin.WrapF(a.handleQRRoot))
+	router.Any("/qr/*path", gin.WrapF(a.handleQR))
 
-    // ── Web 管理路由（需 admin session）──
-    adminGroup := router.Group("", a.RequireAdminAuth())
-    adminGroup.Any("/admin", gin.WrapF(a.handleAdmin))
-    adminGroup.Any("/api/admin/accounts", gin.WrapF(a.handleAdminAccounts))
-    adminGroup.Any("/api/admin/accounts/refresh", gin.WrapF(a.handleAdminRefresh))
-    adminGroup.Any("/api/admin/accounts/delete", gin.WrapF(a.handleAdminDelete))
+	// ── Web 管理路由（需 admin session）──
+	adminGroup := router.Group("", a.RequireAdminAuth())
+	adminGroup.Any("/admin", gin.WrapF(a.handleAdmin))
+	adminGroup.Any("/api/admin/accounts", gin.WrapF(a.handleAdminAccounts))
+	adminGroup.Any("/api/admin/accounts/refresh", gin.WrapF(a.handleAdminRefresh))
+	adminGroup.Any("/api/admin/accounts/delete", gin.WrapF(a.handleAdminDelete))
 
-    // ── 用户路由（需 user session 或 admin session）──
-    userGroup := router.Group("", a.RequireUserAuth())
-    userGroup.Any("/my", gin.WrapF(a.handleMy))
-    userGroup.Any("/api/my/status", gin.WrapF(a.handleMyStatus))
-    userGroup.Any("/api/my/avatar", gin.WrapF(a.handleMyAvatar))
-    userGroup.Any("/api/my/jd-check", gin.WrapF(a.handleMyJdCheck))
-    userGroup.Any("/api/my/jd-cookie", gin.WrapF(a.handleMyJdCookie))
-    userGroup.Any("/api/wx/bind-code", gin.WrapF(a.handleWxBindCode))
-    userGroup.Any("/api/wx/bind-status", gin.WrapF(a.handleWxBindStatus))
+	// ── 用户路由（需 user session 或 admin session）──
+	userGroup := router.Group("", a.RequireUserAuth())
+	userGroup.Any("/my", gin.WrapF(a.handleMy))
+	userGroup.Any("/api/my/status", gin.WrapF(a.handleMyStatus))
+	userGroup.Any("/api/my/avatar", gin.WrapF(a.handleMyAvatar))
+	userGroup.Any("/api/my/jd-check", gin.WrapF(a.handleMyJdCheck))
+	userGroup.Any("/api/my/jd-cookie", gin.WrapF(a.handleMyJdCookie))
+	userGroup.Any("/api/wx/bind-code", gin.WrapF(a.handleWxBindCode))
+	userGroup.Any("/api/wx/bind-status", gin.WrapF(a.handleWxBindStatus))
 
-    // ── 公开的微信绑定/取件路由──
-    router.Any("/api/wx/bind", gin.WrapF(a.handleWxBind))
-    router.Any("/api/wx/pending", gin.WrapF(a.handleWxPending))
+	// ── 公开的微信绑定/取件路由──
+	router.Any("/api/wx/bind", gin.WrapF(a.handleWxBind))
+	router.Any("/api/wx/pending", gin.WrapF(a.handleWxPending))
 
-    // ── 受保护路由（需要鉴权）──
-    protected := router.Group("", a.authMiddleware())
-    protected.Any("/docs", func(c *gin.Context) {
-        c.Redirect(http.StatusMovedPermanently, "/docs/index.html")
-    })
-    protected.Any("/docs/*path", gin.WrapF(a.handleDocs))
-    protected.Any("/openapi.json", gin.WrapF(a.handleOpenAPI))
-    protected.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
-    protected.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
-    protected.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
-    protected.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
-    protected.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
-    protected.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
-    protected.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
-    protected.Any("/api/wx/push", gin.WrapF(a.handleWxPush))
+	// ── 受保护路由（需要鉴权）──
+	protected := router.Group("", a.authMiddleware())
+	protected.Any("/docs", func(c *gin.Context) {
+		c.Redirect(http.StatusMovedPermanently, "/docs/index.html")
+	})
+	protected.Any("/docs/*path", gin.WrapF(a.handleDocs))
+	protected.Any("/openapi.json", gin.WrapF(a.handleOpenAPI))
+	protected.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
+	protected.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
+	protected.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
+	protected.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
+	protected.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
+	protected.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
+	protected.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
+	protected.Any("/api/wx/push", gin.WrapF(a.handleWxPush))
 
-    router.NoRoute(func(c *gin.Context) {
-        writeError(c.Writer, http.StatusNotFound, "not found")
-    })
+	router.NoRoute(func(c *gin.Context) {
+		writeError(c.Writer, http.StatusNotFound, "not found")
+	})
 
-    return router
+	return router
 }
 
 func (a *App) authMiddleware() gin.HandlerFunc {
-    return func(c *gin.Context) {
-        adminCookie, err := c.Cookie("yyb_admin")
-        if err == nil && a.webAuth.IsValidAdmin(adminCookie) {
-            c.Next()
-            return
-        }
+	return func(c *gin.Context) {
+		adminCookie, err := c.Cookie("yyb_admin")
+		if err == nil && a.webAuth.IsValidAdmin(adminCookie) {
+			c.Next()
+			return
+		}
 
-        clientIP := c.ClientIP()
-        for _, allowed := range a.cfg.AllowedIPs {
-            if clientIP == allowed {
-                c.Next()
-                return
-            }
-        }
+		clientIP := c.ClientIP()
+		for _, allowed := range a.cfg.AllowedIPs {
+			if clientIP == allowed {
+				c.Next()
+				return
+			}
+		}
 
-        if a.cfg.APIToken != "" {
-            auth := c.GetHeader("Authorization")
-            if strings.HasPrefix(auth, "Bearer ") && subtle.ConstantTimeCompare([]byte(auth[7:]), []byte(a.cfg.APIToken)) == 1 {
-                c.Next()
-                return
-            }
-        }
+		if a.cfg.APIToken != "" {
+			auth := c.GetHeader("Authorization")
+			if strings.HasPrefix(auth, "Bearer ") && subtle.ConstantTimeCompare([]byte(auth[7:]), []byte(a.cfg.APIToken)) == 1 {
+				c.Next()
+				return
+			}
+		}
 
-        c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": 401, "msg": "unauthorized", "data": nil})
-    }
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": 401, "msg": "unauthorized", "data": nil})
+	}
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {

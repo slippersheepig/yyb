@@ -17,6 +17,7 @@ func TestHandlerServesGinRoutesAndSwaggerDocs(t *testing.T) {
 		AvatarTimeout:  time.Second,
 		SessionTTL:     time.Minute,
 		QRSessionTTL:   time.Minute,
+		AllowedIPs:     []string{"192.0.2.1"},
 	})
 	if err != nil {
 		t.Fatalf("NewApp() error = %v", err)

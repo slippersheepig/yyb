@@ -87,12 +87,8 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	}
 	result := JDCheckResult{Raw: rawStr}
 
-	// lastJdResp/lastRawBody 跟踪"最近一次"京东响应，供 Step 6 兜底检查使用。
-	// 如果后面 full mode（Phase 1.5）发起了新请求，这两个变量会被更新为 full mode 的响应；
-	// 否则保持 code-only（Phase 1）的响应。
-	// 之前的 bug：Step 6 一直只检查最初 code-only 的 jdResp/rawBody，
-	// full mode 拿到的新响应（很可能才是真正带 ACRJUrl 的那个）被完全忽略，
-	// 导致风险认证链接丢失，最终误报「京东返回成功但未捕获到Cookie」。
+	// Track the latest JD response so the final fallback inspects the freshest
+	// response body, including a later full-mode retry when one is available.
 	lastJdResp := jdResp
 	lastRawBody := rawBody
 	fullModeRan := false
@@ -219,8 +215,8 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 			if fullCode, ok := fullCodeResult["code"].(string); ok && fullCode != "" {
 				fullResp, fullCookies, fullRaw, fullJar, _, flErr := callLoginLt(ctx, fullCode, userInfo)
 				if flErr == nil {
-					// full mode 发起了新请求并拿到了响应，Step 6 兜底检查应该用这份最新的，
-					// 而不是继续用最初 code-only 的旧响应。
+					// Use the full-mode response for the final fallback because it is newer
+					// than the initial code-only response.
 					lastJdResp = fullResp
 					lastRawBody = fullRaw
 					fullModeRan = true
@@ -430,12 +426,9 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	}
 
 	// Step 6: Final fallback — check for ACRJUrl regardless of retMsg.
-	// Python 脚本不管 retMsg 内容，只要有 ACRJUrl 就把它展示给用户。
-	// Go 端之前只在 retMsg 含 SUCCESS 时才检查 ACRJUrl，导致风险链接被丢弃。
-	//
-	// 修复：优先检查"最近一次"响应（full mode 跑过就是 full mode 的响应，
-	// 否则是 code-only 的响应）；如果最近一次没有 ACRJUrl，再退回去检查最初
-	// code-only 的响应，双保险，避免任何一侧的风险链接被漏掉。
+	// Match JDCode.py behavior by surfacing any ACRJUrl regardless of retMsg.
+	// Prefer the latest response, then fall back to the initial code-only
+	// response so either attempt can provide the risk URL.
 	retMsg := firstNonEmpty(
 		strVal(lastJdResp, "retMsg"), strVal(lastJdResp, "retmsg"),
 		strVal(lastJdResp, "msg"), strVal(lastJdResp, "message"),
@@ -638,11 +631,11 @@ func tryExtractCookie(a *App, jdResp map[string]any, cookies []*http.Cookie, raw
 
 // userInfo payload for login_lt with full credentials.
 type jdUserInfo struct {
-	RawData     string `json:"rawData"`
-	Signature   string `json:"signature"`
-	EncrytData  string `json:"encrytData"`
-	IV          string `json:"iv"`
-	OpenID      string `json:"openid"`
+	RawData       string `json:"rawData"`
+	Signature     string `json:"signature"`
+	EncryptedData string `json:"encrytData"`
+	IV            string `json:"iv"`
+	OpenID        string `json:"openid"`
 }
 
 func (a *App) getUserInfo(ctx context.Context, acc *store.WechatAccount) (*jdUserInfo, error) {
@@ -694,11 +687,11 @@ func (a *App) getUserInfo(ctx context.Context, acc *store.WechatAccount) (*jdUse
 	}
 
 	return &jdUserInfo{
-		RawData:    rawData,
-		Signature:  signature,
-		EncrytData: encrypted,
-		IV:         iv,
-		OpenID:     openid,
+		RawData:       rawData,
+		Signature:     signature,
+		EncryptedData: encrypted,
+		IV:            iv,
+		OpenID:        openid,
 	}, nil
 }
 
@@ -765,8 +758,8 @@ func callLoginLt(ctx context.Context, code string, userInfo *jdUserInfo) (map[st
 	if userInfo != nil {
 		params.Set("rawData", userInfo.RawData)
 		params.Set("signature", userInfo.Signature)
-		params.Set("encrytData", userInfo.EncrytData)
-		params.Set("encryptedData", userInfo.EncrytData)
+		params.Set("encrytData", userInfo.EncryptedData)
+		params.Set("encryptedData", userInfo.EncryptedData)
 		params.Set("iv", userInfo.IV)
 		params.Set("ou", userInfo.OpenID)
 	}
