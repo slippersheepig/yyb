@@ -26,39 +26,39 @@ func getEnvDefault(key, def string) string {
 }
 
 func parseAllowedIPs(s string) []string {
-    if s == "" {
-        return nil
-    }
-    var ips []string
-    for _, ip := range strings.Split(s, ",") {
-        ip = strings.TrimSpace(ip)
-        if ip != "" {
-            ips = append(ips, ip)
-        }
-    }
-    return ips
+	if s == "" {
+		return nil
+	}
+	var ips []string
+	for _, ip := range strings.Split(s, ",") {
+		ip = strings.TrimSpace(ip)
+		if ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
 }
 
 // parseAdminIDs parses a comma-separated list of Telegram user IDs.
 // Example: "123456789,987654321"
 func parseAdminIDs(s string) []int64 {
-    if s == "" {
-        return nil
-    }
-    var ids []int64
-    for _, part := range strings.Split(s, ",") {
-        part = strings.TrimSpace(part)
-        if part == "" {
-            continue
-        }
-        id, err := strconv.ParseInt(part, 10, 64)
-        if err != nil {
-            log.Printf("[main] invalid TG_ADMIN_IDS entry %q: %v", part, err)
-            continue
-        }
-        ids = append(ids, id)
-    }
-    return ids
+	if s == "" {
+		return nil
+	}
+	var ids []int64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			log.Printf("[main] invalid TG_ADMIN_IDS entry %q: %v", part, err)
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func main() {

@@ -101,38 +101,38 @@ type DB struct {
 }
 
 type WechatAccount struct {
-	ID            int64          `json:"id"`
-	OpenID        string         `json:"openid"`
-	UIN           *int64         `json:"uin,omitempty"`
-	Alias         *string        `json:"alias,omitempty"`
-	Nickname      *string        `json:"nickname,omitempty"`
-	Avatar        *string        `json:"avatar,omitempty"`
-	UserInfo      map[string]any `json:"user_info,omitempty"`
-	LoginBuffer   string         `json:"login_buffer,omitempty"`
-	Credentials   map[string]any `json:"credentials,omitempty"`
-	Status        *string        `json:"status,omitempty"`
-	JdRiskURL      *string  `json:"jd_risk_url,omitempty"`
-	JdRiskExpireAt *int64   `json:"jd_risk_expire_at,omitempty"`
-	JdCookie       *string  `json:"jd_cookie,omitempty"`
-	LastCheckedAt *int64         `json:"last_checked_at,omitempty"`
-	CreatedAt     int64          `json:"created_at"`
-	UpdatedAt     int64          `json:"updated_at"`
+	ID             int64          `json:"id"`
+	OpenID         string         `json:"openid"`
+	UIN            *int64         `json:"uin,omitempty"`
+	Alias          *string        `json:"alias,omitempty"`
+	Nickname       *string        `json:"nickname,omitempty"`
+	Avatar         *string        `json:"avatar,omitempty"`
+	UserInfo       map[string]any `json:"user_info,omitempty"`
+	LoginBuffer    string         `json:"login_buffer,omitempty"`
+	Credentials    map[string]any `json:"credentials,omitempty"`
+	Status         *string        `json:"status,omitempty"`
+	JdRiskURL      *string        `json:"jd_risk_url,omitempty"`
+	JdRiskExpireAt *int64         `json:"jd_risk_expire_at,omitempty"`
+	JdCookie       *string        `json:"jd_cookie,omitempty"`
+	LastCheckedAt  *int64         `json:"last_checked_at,omitempty"`
+	CreatedAt      int64          `json:"created_at"`
+	UpdatedAt      int64          `json:"updated_at"`
 }
 
 type AccountPublic struct {
-	ID            int64   `json:"id"`
-	OpenID        string  `json:"openid"`
-	UIN           *int64  `json:"uin"`
-	Alias         *string `json:"alias"`
-	Nickname      *string `json:"nickname"`
-	Avatar        *string `json:"avatar"`
-	Status        *string `json:"status"`
+	ID             int64   `json:"id"`
+	OpenID         string  `json:"openid"`
+	UIN            *int64  `json:"uin"`
+	Alias          *string `json:"alias"`
+	Nickname       *string `json:"nickname"`
+	Avatar         *string `json:"avatar"`
+	Status         *string `json:"status"`
 	JdRiskURL      *string `json:"jd_risk_url,omitempty"`
 	JdRiskExpireAt *int64  `json:"jd_risk_expire_at,omitempty"`
 	JdCookie       *string `json:"jd_cookie,omitempty"`
-	LastCheckedAt *int64  `json:"last_checked_at"`
-	CreatedAt     int64   `json:"created_at"`
-	UpdatedAt     int64   `json:"updated_at"`
+	LastCheckedAt  *int64  `json:"last_checked_at"`
+	CreatedAt      int64   `json:"created_at"`
+	UpdatedAt      int64   `json:"updated_at"`
 }
 
 type SessionRow struct {
@@ -204,6 +204,10 @@ func Open(path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if _, err = db.ExecContext(ctx, schema); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err = migrateSessionsTable(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -217,10 +221,6 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = migrateJdCookieColumn(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if _, err = db.ExecContext(ctx, schema); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -708,7 +708,7 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 		alias, nickname, avatar sql.NullString
 		userJSON, credJSON      sql.NullString
 		status, jdRiskURL       sql.NullString
-		jdRiskExpire           sql.NullInt64
+		jdRiskExpire            sql.NullInt64
 		jdCookie                sql.NullString
 	)
 	err := row.Scan(
