@@ -88,7 +88,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	result := JDCheckResult{Raw: rawStr}
 
 	// lastJdResp/lastRawBody 跟踪"最近一次"京东响应，供 Step 6 兜底检查使用。
-	// 如果后面 full mode（Phase 2）发起了新请求，这两个变量会被更新为 full mode 的响应；
+	// 如果后面 full mode（Phase 1.5）发起了新请求，这两个变量会被更新为 full mode 的响应；
 	// 否则保持 code-only（Phase 1）的响应。
 	// 之前的 bug：Step 6 一直只检查最初 code-only 的 jdResp/rawBody，
 	// full mode 拿到的新响应（很可能才是真正带 ACRJUrl 的那个）被完全忽略，
@@ -206,12 +206,68 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		}
 	}
 
+	// ── Phase 1.5: full mode fallback (matching JDCode.py attempt_code_login(full=true)) ──
+	// code-only 全部失败后，获取 getUserInfo 并带完整参数重试 login_lt。
+	// 这对应 JDCode.py auto 模式：code-only 失败 → full mode 重试。
+	// full mode 带 userInfo 参数（rawData/signature/encryptedData/iv），京东信任级别更高，
+	// 更可能返回 pt_key 或 ACRJUrl。提前到这里跑，避免前面消耗大量时间和微信侧 code 配额。
+	userInfo, uiErr := a.getUserInfo(ctx, acc)
+	if uiErr == nil && userInfo != nil {
+		// 取新 code（不复用旧 code）。
+		fullCodeResult, fcErr := a.pool.GetCode(ctx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
+		if fcErr == nil {
+			if fullCode, ok := fullCodeResult["code"].(string); ok && fullCode != "" {
+				fullResp, fullCookies, fullRaw, fullJar, _, flErr := callLoginLt(ctx, fullCode, userInfo)
+				if flErr == nil {
+					// full mode 发起了新请求并拿到了响应，Step 6 兜底检查应该用这份最新的，
+					// 而不是继续用最初 code-only 的旧响应。
+					lastJdResp = fullResp
+					lastRawBody = fullRaw
+					fullModeRan = true
+
+					// 重复 Step 1-5 with full params。
+					fullResult := tryExtractCookie(a, fullResp, fullCookies, fullRaw, fullJar, ctx, acc)
+					if fullResult.Cookie != "" {
+						result.Status = "ok"
+						result.PTKey = parseCookieValue(fullResult.Cookie, "pt_key")
+						result.Pin = parseCookieValue(fullResult.Cookie, "pt_pin")
+						result.Message = "京东登录成功（full mode）"
+						result.JdCookie = fullResult.Cookie
+						_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+						return result, nil
+					}
+					// full mode 也检测到了 risk URL — 返回给用户。
+					if fullResult.RiskURL != "" {
+						riskURL := fullResult.RiskURL
+						acrjStateFull := extractACRJState(fullResp, fullRaw)
+						if acrjStateFull != "" && !strings.Contains(riskURL, "ACRJState=") {
+							parsed, err := url.Parse(riskURL)
+							if err == nil {
+								q := parsed.Query()
+								q.Set("ACRJState", acrjStateFull)
+								parsed.RawQuery = q.Encode()
+								riskURL = parsed.String()
+							}
+						}
+						result.Status = "risk"
+						result.RiskURL = riskURL
+						result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+						result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + riskURL
+						_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, riskURL, riskURLTTL)
+						return result, nil
+					}
+				}
+			}
+		}
+	}
+
 	// Step 5.1: Post-SFS retry — SFS exchange failure often triggers JD's risk
 	// control state internally. A fresh code-only login_lt at this point
 	// frequently returns the ACRJUrl that was missing in the first attempt.
 	// This bridges the timing gap observed between yyb Go端 and JDCode.py:
 	// yyb's SFS failure primes JD risk state, but without a retry the risk
 	// URL is never captured — only JDCode.py (running later) sees it.
+	// Also try full mode retry if userInfo is available (Bug 2 fix).
 	retryCtx, retryCancel := context.WithTimeout(context.Background(), jdLoginTimeout)
 	retryCodeResult, rcErr := a.pool.GetCode(retryCtx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
 	if rcErr == nil {
@@ -280,6 +336,75 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 				}
 			}
 		}
+
+		// Bug 2 fix: Also try full mode retry if userInfo is available.
+		// post-SFS retry 之前只做 code-only，现在也尝试带 userInfo 的 full mode 重试。
+		if userInfo != nil {
+			fullRetryCodeResult, frcErr := a.pool.GetCode(retryCtx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
+			if frcErr == nil {
+				if fullRetryCode, ok := fullRetryCodeResult["code"].(string); ok && fullRetryCode != "" {
+					frResp, frCookies, frRaw, frJar, _, frErr := callLoginLt(retryCtx, fullRetryCode, userInfo)
+					if frErr == nil {
+						lastJdResp = frResp
+						lastRawBody = frRaw
+
+						frRiskURL := extractACRJUrl(frResp, frRaw)
+						frRiskState := extractACRJState(frResp, frRaw)
+						if frRiskURL != "" {
+							if frRiskState != "" && !strings.Contains(frRiskURL, "ACRJState=") {
+								parsed, err := url.Parse(frRiskURL)
+								if err == nil {
+									q := parsed.Query()
+									q.Set("ACRJState", frRiskState)
+									parsed.RawQuery = q.Encode()
+									frRiskURL = parsed.String()
+								}
+							}
+							result.Status = "risk"
+							result.RiskURL = frRiskURL
+							result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+							result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + frRiskURL
+							_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, frRiskURL, riskURLTTL)
+							retryCancel()
+							return result, nil
+						}
+
+						frCk := extractPtCookie(frCookies)
+						if frCk != "" {
+							result.Status = "ok"
+							result.PTKey = parseCookieValue(frCk, "pt_key")
+							result.Pin = parseCookieValue(frCk, "pt_pin")
+							result.Message = "京东登录成功（post-SFS full mode retry）"
+							result.JdCookie = frCk
+							_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+							retryCancel()
+							return result, nil
+						}
+
+						frSfs := sfsExchangePtKey(retryCtx, frCookies, frJar)
+						if frSfs.Cookie != "" {
+							result.Status = "ok"
+							result.PTKey = parseCookieValue(frSfs.Cookie, "pt_key")
+							result.Pin = parseCookieValue(frSfs.Cookie, "pt_pin")
+							result.Message = "京东登录成功（post-SFS full mode retry + SFS）"
+							result.JdCookie = frSfs.Cookie
+							_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+							retryCancel()
+							return result, nil
+						}
+						if frSfs.RiskURL != "" {
+							result.Status = "risk"
+							result.RiskURL = frSfs.RiskURL
+							result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+							result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + frSfs.RiskURL
+							_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, frSfs.RiskURL, riskURLTTL)
+							retryCancel()
+							return result, nil
+						}
+					}
+				}
+			}
+		}
 	}
 	retryCancel()
 
@@ -300,80 +425,6 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 				result.JdCookie = ptCk
 				_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 				return result, nil
-			}
-		}
-	}
-
-	// ── Phase 2: full mode fallback (matching JDCode.py attempt_code_login(full=true)) ──
-	// code-only 全部失败后，获取 getUserInfo 并带完整参数重试 login_lt。
-	// 这对应 JDCode.py auto 模式：code-only 失败 → full mode 重试。
-
-	userInfo, uiErr := a.getUserInfo(ctx, acc)
-	if uiErr == nil && userInfo != nil {
-		// 取新 code（不复用旧 code）。
-		fullCodeResult, fcErr := a.pool.GetCode(ctx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
-		if fcErr == nil {
-			if fullCode, ok := fullCodeResult["code"].(string); ok && fullCode != "" {
-				fullResp, fullCookies, fullRaw, fullJar, _, flErr := callLoginLt(ctx, fullCode, userInfo)
-				if flErr == nil {
-					// full mode 发起了新请求并拿到了响应，Step 6 兜底检查应该用这份最新的，
-					// 而不是继续用最初 code-only 的旧响应。
-					lastJdResp = fullResp
-					lastRawBody = fullRaw
-					fullModeRan = true
-
-					// 重复 Step 1-5 with full params。
-					fullResult := tryExtractCookie(fullResp, fullCookies, fullRaw, fullJar, ctx, acc)
-					if fullResult.Cookie != "" {
-						result.Status = "ok"
-						result.PTKey = parseCookieValue(fullResult.Cookie, "pt_key")
-						result.Pin = parseCookieValue(fullResult.Cookie, "pt_pin")
-						result.Message = "京东登录成功（full mode）"
-						result.JdCookie = fullResult.Cookie
-						_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
-						return result, nil
-					}
-					// full mode 也检测到了 risk URL — 返回给用户。
-					if fullResult.RiskURL != "" {
-						riskURL := fullResult.RiskURL
-						acrjStateFull := extractACRJState(fullResp, fullRaw)
-						if acrjStateFull != "" && !strings.Contains(riskURL, "ACRJState=") {
-							parsed, err := url.Parse(riskURL)
-							if err == nil {
-								q := parsed.Query()
-								q.Set("ACRJState", acrjStateFull)
-								parsed.RawQuery = q.Encode()
-								riskURL = parsed.String()
-							}
-						}
-						result.Status = "risk"
-						result.RiskURL = riskURL
-						result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-						result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + riskURL
-						_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, riskURL, riskURLTTL)
-						return result, nil
-					}
-
-					// full mode 也走 PT exchange。
-					ptCtx2, ptCancel2 := context.WithTimeout(context.Background(), jdPTTimeout)
-					defer ptCancel2()
-
-					ptCode2, ptErr2 := a.pool.GetCode(ptCtx2, acc.LoginBuffer, jdPTAppID, acc.ID, a.cfg.TCPProxy)
-					if ptErr2 == nil && ptCode2 != nil {
-						if ptCodeVal2, ok := ptCode2["code"].(string); ok && ptCodeVal2 != "" {
-							ptCk2 := jdPtCookieLogin(ptCtx2, ptCodeVal2)
-							if ptCk2 != "" {
-								result.Status = "ok"
-								result.PTKey = parseCookieValue(ptCk2, "pt_key")
-								result.Pin = parseCookieValue(ptCk2, "pt_pin")
-								result.Message = "京东登录成功（full mode + PT exchange）"
-								result.JdCookie = ptCk2
-								_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
-								return result, nil
-							}
-						}
-					}
-				}
 			}
 		}
 	}
@@ -452,7 +503,7 @@ type tryExtractCookieResult struct {
 	RiskURL string
 }
 
-func tryExtractCookie(jdResp map[string]any, cookies []*http.Cookie, rawBody string, jar *cookiejar.Jar, ctx context.Context, acc *store.WechatAccount) tryExtractCookieResult {
+func tryExtractCookie(a *App, jdResp map[string]any, cookies []*http.Cookie, rawBody string, jar *cookiejar.Jar, ctx context.Context, acc *store.WechatAccount) tryExtractCookieResult {
 	result := tryExtractCookieResult{}
 
 	// Step 1: risk check — capture the risk URL instead of swallowing it.
@@ -500,6 +551,83 @@ func tryExtractCookie(jdResp map[string]any, cookies []*http.Cookie, rawBody str
 	}
 	if sfsRes.RiskURL != "" {
 		result.RiskURL = sfsRes.RiskURL
+		return result
+	}
+
+	// Bug 3 fix: Post-SFS retry — SFS exchange failure means JD server-side state
+	// hasn't synced. Wait 3 seconds for JD risk control state to settle, then
+	// get a fresh code and retry login_lt. This mirrors the post-SFS retry in
+	// checkJDLogin's Step 5.1 but within tryExtractCookie so full mode also benefits.
+	log.Printf("[JD验证-tryExtractCookie] SFS交换失败，等待3秒后重试login_lt（等待JD服务端状态同步）")
+	select {
+	case <-time.After(3 * time.Second):
+	case <-ctx.Done():
+		return result
+	}
+
+	// Get a fresh code and retry login_lt (code-only, since we don't have userInfo here).
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), jdLoginTimeout)
+	defer retryCancel()
+
+	retryCodeResult, rcErr := a.pool.GetCode(retryCtx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
+	if rcErr != nil {
+		return result
+	}
+	retryCode, ok := retryCodeResult["code"].(string)
+	if !ok || retryCode == "" {
+		return result
+	}
+
+	retryResp, retryCookies, retryRaw, retryJar, _, rlErr := callLoginLt(retryCtx, retryCode, nil)
+	if rlErr != nil {
+		return result
+	}
+
+	// Re-run Steps 1-5 on the retry response.
+	// Step 1: risk check.
+	retryRiskURL := extractACRJUrl(retryResp, retryRaw)
+	if retryRiskURL != "" && isRiskURL(retryRiskURL) {
+		result.RiskURL = retryRiskURL
+		return result
+	}
+
+	// Step 2: cookie jar.
+	retryCk := extractPtCookie(retryCookies)
+	if retryCk != "" {
+		result.Cookie = retryCk
+		return result
+	}
+
+	// Step 3: response body.
+	retryBodyCk := extractPtCookieFromBody(retryResp)
+	if retryBodyCk != "" {
+		result.Cookie = retryBodyCk
+		return result
+	}
+
+	// Step 4: ACRJUrl refresh chain.
+	retryAcrjURL := extractACRJUrl(retryResp, retryRaw)
+	retryAcrjState := extractACRJState(retryResp, retryRaw)
+	if retryAcrjURL != "" {
+		refreshCk, err := followServerRefresh(retryCtx, retryAcrjURL, retryAcrjState, retryJar)
+		if err == nil && refreshCk != "" {
+			result.Cookie = refreshCk
+			return result
+		}
+		if isRiskURL(retryAcrjURL) {
+			result.RiskURL = retryAcrjURL
+			return result
+		}
+	}
+
+	// Step 5: SFS exchange on retry response.
+	retrySfs := sfsExchangePtKey(retryCtx, retryCookies, retryJar)
+	if retrySfs.Cookie != "" {
+		result.Cookie = retrySfs.Cookie
+		return result
+	}
+	if retrySfs.RiskURL != "" {
+		result.RiskURL = retrySfs.RiskURL
 		return result
 	}
 
