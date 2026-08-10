@@ -192,6 +192,19 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		return result, nil
 	}
 
+	// 在升级到 full mode 之前，先尝试 PT OAuth 兑换一次（对应 JDCode.py 的
+	// exchange_pt_cookie：每次 login_lt 尝试失败后都会先试 PT 换取 pt_key，
+	// 而不是把 PT 兑换留到所有 login_lt 尝试都结束后才做）。
+	if ptCk := a.attemptPTExchange(ctx, acc); ptCk != "" {
+		result.Status = "ok"
+		result.PTKey = parseCookieValue(ptCk, "pt_key")
+		result.Pin = parseCookieValue(ptCk, "pt_pin")
+		result.Message = "京东登录成功（PT exchange）"
+		result.JdCookie = ptCk
+		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		return result, nil
+	}
+
 	// SFS exchange returned nothing — JD server-side state sync has latency.
 	// Wait 3 seconds before retrying so JD risk control state can settle.
 	if sfsRes.Cookie == "" && sfsRes.RiskURL == "" {
@@ -257,172 +270,17 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		}
 	}
 
-	// Step 5.1: Post-SFS retry — SFS exchange failure often triggers JD's risk
-	// control state internally. A fresh code-only login_lt at this point
-	// frequently returns the ACRJUrl that was missing in the first attempt.
-	// This bridges the timing gap observed between yyb Go端 and JDCode.py:
-	// yyb's SFS failure primes JD risk state, but without a retry the risk
-	// URL is never captured — only JDCode.py (running later) sees it.
-	// Also try full mode retry if userInfo is available (Bug 2 fix).
-	retryCtx, retryCancel := context.WithTimeout(context.Background(), jdLoginTimeout)
-	retryCodeResult, rcErr := a.pool.GetCode(retryCtx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
-	if rcErr == nil {
-		if retryCode, ok := retryCodeResult["code"].(string); ok && retryCode != "" {
-			retryResp, retryCookies, retryRaw, retryJar, _, rlErr := callLoginLt(retryCtx, retryCode, nil)
-			if rlErr == nil {
-				// Update lastJdResp/lastRawBody so Step 6 fallback sees the latest response.
-				lastJdResp = retryResp
-				lastRawBody = retryRaw
-
-				// Check for risk URL first — this is the primary purpose of the retry.
-				retryRiskURL := extractACRJUrl(retryResp, retryRaw)
-				retryRiskState := extractACRJState(retryResp, retryRaw)
-				if retryRiskURL != "" {
-					if retryRiskState != "" && !strings.Contains(retryRiskURL, "ACRJState=") {
-						parsed, err := url.Parse(retryRiskURL)
-						if err == nil {
-							q := parsed.Query()
-							q.Set("ACRJState", retryRiskState)
-							parsed.RawQuery = q.Encode()
-							retryRiskURL = parsed.String()
-						}
-					}
-					result.Status = "risk"
-					result.RiskURL = retryRiskURL
-					result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-					result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + retryRiskURL
-					_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, retryRiskURL, riskURLTTL)
-					retryCancel()
-					return result, nil
-				}
-
-				// Check for pt_key in the retry response.
-				retryCk := extractPtCookie(retryCookies)
-				if retryCk != "" {
-					result.Status = "ok"
-					result.PTKey = parseCookieValue(retryCk, "pt_key")
-					result.Pin = parseCookieValue(retryCk, "pt_pin")
-					result.Message = "京东登录成功（post-SFS retry）"
-					result.JdCookie = retryCk
-					_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
-					retryCancel()
-					return result, nil
-				}
-
-				// Try SFS exchange on the retry response too.
-				retrySfs := sfsExchangePtKey(retryCtx, retryCookies, retryJar)
-				if retrySfs.Cookie != "" {
-					result.Status = "ok"
-					result.PTKey = parseCookieValue(retrySfs.Cookie, "pt_key")
-					result.Pin = parseCookieValue(retrySfs.Cookie, "pt_pin")
-					result.Message = "京东登录成功（post-SFS retry + SFS）"
-					result.JdCookie = retrySfs.Cookie
-					_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
-					retryCancel()
-					return result, nil
-				}
-				if retrySfs.RiskURL != "" {
-					result.Status = "risk"
-					result.RiskURL = retrySfs.RiskURL
-					result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-					result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + retrySfs.RiskURL
-					_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, retrySfs.RiskURL, riskURLTTL)
-					retryCancel()
-					return result, nil
-				}
-			}
-		}
-
-		// Bug 2 fix: Also try full mode retry if userInfo is available.
-		// post-SFS retry 之前只做 code-only，现在也尝试带 userInfo 的 full mode 重试。
-		if userInfo != nil {
-			fullRetryCodeResult, frcErr := a.pool.GetCode(retryCtx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
-			if frcErr == nil {
-				if fullRetryCode, ok := fullRetryCodeResult["code"].(string); ok && fullRetryCode != "" {
-					frResp, frCookies, frRaw, frJar, _, frErr := callLoginLt(retryCtx, fullRetryCode, userInfo)
-					if frErr == nil {
-						lastJdResp = frResp
-						lastRawBody = frRaw
-
-						frRiskURL := extractACRJUrl(frResp, frRaw)
-						frRiskState := extractACRJState(frResp, frRaw)
-						if frRiskURL != "" {
-							if frRiskState != "" && !strings.Contains(frRiskURL, "ACRJState=") {
-								parsed, err := url.Parse(frRiskURL)
-								if err == nil {
-									q := parsed.Query()
-									q.Set("ACRJState", frRiskState)
-									parsed.RawQuery = q.Encode()
-									frRiskURL = parsed.String()
-								}
-							}
-							result.Status = "risk"
-							result.RiskURL = frRiskURL
-							result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-							result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + frRiskURL
-							_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, frRiskURL, riskURLTTL)
-							retryCancel()
-							return result, nil
-						}
-
-						frCk := extractPtCookie(frCookies)
-						if frCk != "" {
-							result.Status = "ok"
-							result.PTKey = parseCookieValue(frCk, "pt_key")
-							result.Pin = parseCookieValue(frCk, "pt_pin")
-							result.Message = "京东登录成功（post-SFS full mode retry）"
-							result.JdCookie = frCk
-							_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
-							retryCancel()
-							return result, nil
-						}
-
-						frSfs := sfsExchangePtKey(retryCtx, frCookies, frJar)
-						if frSfs.Cookie != "" {
-							result.Status = "ok"
-							result.PTKey = parseCookieValue(frSfs.Cookie, "pt_key")
-							result.Pin = parseCookieValue(frSfs.Cookie, "pt_pin")
-							result.Message = "京东登录成功（post-SFS full mode retry + SFS）"
-							result.JdCookie = frSfs.Cookie
-							_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
-							retryCancel()
-							return result, nil
-						}
-						if frSfs.RiskURL != "" {
-							result.Status = "risk"
-							result.RiskURL = frSfs.RiskURL
-							result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-							result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + frSfs.RiskURL
-							_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, frSfs.RiskURL, riskURLTTL)
-							retryCancel()
-							return result, nil
-						}
-					}
-				}
-			}
-		}
-	}
-	retryCancel()
-
-	// Step 5.5: PT exchange — use PT appid to get a fresh code, then walk the PT OAuth chain.
-	// 用独立 context 避免 deadline propagation（前面步骤已消耗部分时间）。
-	ptCtx, ptCancel := context.WithTimeout(context.Background(), jdPTTimeout)
-	defer ptCancel()
-
-	ptCode, ptErr := a.pool.GetCode(ptCtx, acc.LoginBuffer, jdPTAppID, acc.ID, a.cfg.TCPProxy)
-	if ptErr == nil && ptCode != nil {
-		if ptCodeVal, ok := ptCode["code"].(string); ok && ptCodeVal != "" {
-			ptCk := jdPtCookieLogin(ptCtx, ptCodeVal)
-			if ptCk != "" {
-				result.Status = "ok"
-				result.PTKey = parseCookieValue(ptCk, "pt_key")
-				result.Pin = parseCookieValue(ptCk, "pt_pin")
-				result.Message = "京东登录成功"
-				result.JdCookie = ptCk
-				_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
-				return result, nil
-			}
-		}
+	// Step 5.5: PT exchange fallback -- walk the PT OAuth chain once more
+	// with a fresh PT-specific code (matching JDCode.py's exchange_pt_cookie,
+	// which JDCode.py also retries as the last resort after full mode fails).
+	if ptCk := a.attemptPTExchange(ctx, acc); ptCk != "" {
+		result.Status = "ok"
+		result.PTKey = parseCookieValue(ptCk, "pt_key")
+		result.Pin = parseCookieValue(ptCk, "pt_pin")
+		result.Message = "京东登录成功（PT exchange）"
+		result.JdCookie = ptCk
+		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		return result, nil
 	}
 
 	// Step 6: Final fallback — check for ACRJUrl regardless of retMsg.
@@ -485,6 +343,27 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 	return result, fmt.Errorf("unknown JD response: retCode=%v retMsg=%s", lastJdResp["retCode"], retMsg)
 }
 
+// attemptPTExchange fetches a fresh PT-specific code and walks JD's PT OAuth
+// chain (login.action -> oauth redirect -> callback) to recover pt_key/pt_pin.
+// This mirrors JDCode.py's exchange_pt_cookie, which JDCode.py retries after
+// EVERY login_lt attempt (code-only and full mode) rather than only once at
+// the very end -- this brings checkJDLogin's retry shape closer to the
+// proven-working JDCode.py flow (fewer, better-spaced JD-side attempts).
+func (a *App) attemptPTExchange(ctx context.Context, acc *store.WechatAccount) string {
+	ptCtx, ptCancel := context.WithTimeout(context.Background(), jdPTTimeout)
+	defer ptCancel()
+
+	ptCode, ptErr := a.pool.GetCode(ptCtx, acc.LoginBuffer, jdPTAppID, acc.ID, a.cfg.TCPProxy)
+	if ptErr != nil || ptCode == nil {
+		return ""
+	}
+	ptCodeVal, ok := ptCode["code"].(string)
+	if !ok || ptCodeVal == "" {
+		return ""
+	}
+	return jdPtCookieLogin(ptCtx, ptCodeVal)
+}
+
 // ── tryExtractCookie runs Steps 1-5 on a given login_lt response, returning
 // the first pt_key/pt_pin cookie found, or "" if all steps fail. ──
 
@@ -544,83 +423,6 @@ func tryExtractCookie(a *App, jdResp map[string]any, cookies []*http.Cookie, raw
 	}
 	if sfsRes.RiskURL != "" {
 		result.RiskURL = sfsRes.RiskURL
-		return result
-	}
-
-	// Bug 3 fix: Post-SFS retry — SFS exchange failure means JD server-side state
-	// hasn't synced. Wait 3 seconds for JD risk control state to settle, then
-	// get a fresh code and retry login_lt. This mirrors the post-SFS retry in
-	// checkJDLogin's Step 5.1 but within tryExtractCookie so full mode also benefits.
-	log.Printf("[JD验证-tryExtractCookie] SFS交换失败，等待3秒后重试login_lt（等待JD服务端状态同步）")
-	select {
-	case <-time.After(3 * time.Second):
-	case <-ctx.Done():
-		return result
-	}
-
-	// Get a fresh code and retry login_lt (code-only, since we don't have userInfo here).
-	retryCtx, retryCancel := context.WithTimeout(context.Background(), jdLoginTimeout)
-	defer retryCancel()
-
-	retryCodeResult, rcErr := a.pool.GetCode(retryCtx, acc.LoginBuffer, jdAppID, acc.ID, a.cfg.TCPProxy)
-	if rcErr != nil {
-		return result
-	}
-	retryCode, ok := retryCodeResult["code"].(string)
-	if !ok || retryCode == "" {
-		return result
-	}
-
-	retryResp, retryCookies, retryRaw, retryJar, _, rlErr := callLoginLt(retryCtx, retryCode, nil)
-	if rlErr != nil {
-		return result
-	}
-
-	// Re-run Steps 1-5 on the retry response.
-	// Step 1: risk check.
-	retryRiskURL := extractACRJUrl(retryResp, retryRaw)
-	if retryRiskURL != "" && isRiskURL(retryRiskURL) {
-		result.RiskURL = retryRiskURL
-		return result
-	}
-
-	// Step 2: cookie jar.
-	retryCk := extractPtCookie(retryCookies)
-	if retryCk != "" {
-		result.Cookie = retryCk
-		return result
-	}
-
-	// Step 3: response body.
-	retryBodyCk := extractPtCookieFromBody(retryResp)
-	if retryBodyCk != "" {
-		result.Cookie = retryBodyCk
-		return result
-	}
-
-	// Step 4: ACRJUrl refresh chain.
-	retryAcrjURL := extractACRJUrl(retryResp, retryRaw)
-	retryAcrjState := extractACRJState(retryResp, retryRaw)
-	if retryAcrjURL != "" {
-		refreshCk, err := followServerRefresh(retryCtx, retryAcrjURL, retryAcrjState, retryJar)
-		if err == nil && refreshCk != "" {
-			result.Cookie = refreshCk
-			return result
-		}
-		if isRiskURL(retryAcrjURL) {
-			result.RiskURL = retryAcrjURL
-			return result
-		}
-	}
-
-	// Step 5: SFS exchange on retry response.
-	retrySfs := sfsExchangePtKey(retryCtx, retryCookies, retryJar)
-	if retrySfs.Cookie != "" {
-		result.Cookie = retrySfs.Cookie
-		return result
-	}
-	if retrySfs.RiskURL != "" {
-		result.RiskURL = retrySfs.RiskURL
 		return result
 	}
 
@@ -1555,7 +1357,12 @@ func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := a.checkJDLogin(r.Context(), acc)
-	if result.Status == "risk" || result.Status == "error" {
+	if result.Status == "risk" {
+		// 京东风控状态从"完成验证"到服务端确认清除通常需要数十秒；
+		// 过快点击「重新验证」大概率会命中一个全新的、尚未验证过的风险链接。
+		result.Message += "\n完成上方链接的验证后，请稍等 30-60 秒再点击「重新验证」，京东风控状态同步需要一点时间，过快重试很可能会看到一个新的验证链接。"
+	}
+	if result.Status == "error" {
 		result.Message += "\n您也可以尝试打开“京东购物”微信小程序，右下角点“我的”-右上角点“设置”-页面拉到底，点击“退出”，重新登录后返回此页面点击「重新扫码」。"
 	}
 	if err != nil && result.Status == "error" {
