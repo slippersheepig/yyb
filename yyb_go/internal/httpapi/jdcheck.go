@@ -111,7 +111,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		result.Status = "risk"
 		result.RiskURL = riskURL
 		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证"
+		result.Message = "京东返回二验，请点击下方链接完成认证后重新验证"
 		_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, riskURL, riskURLTTL)
 		return result, nil
 	}
@@ -166,7 +166,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 			result.Status = "risk"
 			result.RiskURL = acrjURL
 			result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-			result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + acrjURL
+			result.Message = "京东返回二验，请点击下方链接完成认证后重新验证\n" + acrjURL
 			_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, acrjURL, riskURLTTL)
 			return result, nil
 		}
@@ -187,7 +187,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		result.Status = "risk"
 		result.RiskURL = sfsRes.RiskURL
 		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + sfsRes.RiskURL
+		result.Message = "京东返回二验，请点击下方链接完成认证后重新验证\n" + sfsRes.RiskURL
 		_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, sfsRes.RiskURL, riskURLTTL)
 		return result, nil
 	}
@@ -261,7 +261,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 						result.Status = "risk"
 						result.RiskURL = riskURL
 						result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-						result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + riskURL
+						result.Message = "京东返回二验，请点击下方链接完成认证后重新验证\n" + riskURL
 						_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, riskURL, riskURLTTL)
 						return result, nil
 					}
@@ -315,7 +315,7 @@ func (a *App) checkJDLogin(ctx context.Context, acc *store.WechatAccount) (JDChe
 		result.Status = "risk"
 		result.RiskURL = finalRiskURL
 		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-		result.Message = "京东返回需二次验证，请点击下方链接完成认证后重新验证：\n" + finalRiskURL
+		result.Message = "京东返回二验，请点击下方链接完成认证后重新验证\n" + finalRiskURL
 		_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, finalRiskURL, riskURLTTL)
 		return result, nil
 	}
@@ -1358,8 +1358,6 @@ func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 
 	result, err := a.checkJDLogin(r.Context(), acc)
 	if result.Status == "risk" {
-		// 京东风控状态从"完成验证"到服务端确认清除通常需要数十秒；
-		// 过快点击「重新验证」大概率会命中一个全新的、尚未验证过的风险链接。
 		result.Message += "\n完成上方链接的验证后，请稍等 30-60 秒再点击「重新验证」，京东风控状态同步需要一点时间，过快重试很可能会看到一个新的验证链接。"
 	}
 	if result.Status == "error" {
