@@ -238,7 +238,7 @@ func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 	result, _ := a.callAutopost(r.Context(), acc)
 
 	if result.Status == "error" {
-		result.Message += "\n您也可以尝试打开"京东购物"微信小程序，右下角点"我的"-右上角点"设置"-页面拉到底，点击"退出"，重新登录后返回此页面点击「重新扫码」。"
+		result.Message += "\n您也可以尝试打开“京东购物”微信小程序，右下角点“我的”-右上角点“设置”-页面拉到底，点击“退出”，重新登录后返回此页面点击「重新扫码」。"
 	}
 
 	// Push notification via WeChat if configured.
