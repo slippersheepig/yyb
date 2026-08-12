@@ -86,6 +86,10 @@ func main() {
 		WebPass:        os.Getenv("YYB_WEB_PASS"),
 		WxGzhLink:      getEnvDefault("YYB_WX_GZH_LINK", "/static/gzh.png"),
 		WxGzhName:      getEnvDefault("YYB_WX_GZH_NAME", "3DS电影"),
+		AutopostURL:    os.Getenv("AUTORPOST_URL"),
+		AutopostToken:  os.Getenv("AUTORPOST_TOKEN"),
+		WebDomain:      os.Getenv("YYB_WEB_DOMAIN"),
+		ListenPort:     *port,
 	}
 
 	app, err := httpapi.NewApp(cfg)
