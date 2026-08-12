@@ -41,6 +41,10 @@ type Config struct {
 	WebPass        string
 	WxGzhLink      string
 	WxGzhName      string
+	AutopostURL    string // autopost service URL for JD verification
+	AutopostToken  string // Bearer token for autopost service auth
+	WebDomain      string // this server's external URL (e.g. https://yyb.example.com)
+	ListenPort     int    // this server's listen port (for fallback WebDomain)
 }
 
 type App struct {
