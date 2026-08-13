@@ -345,14 +345,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		if a.webAuth.CheckAdminLogin(user, pass) {
 			token, expiry := a.webAuth.CreateAdminSession(24 * time.Hour)
-			http.SetCookie(w, &http.Cookie{
-				Name:     "yyb_admin",
-				Value:    token,
-				Path:     "/",
-				Expires:  expiry,
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-			})
+			http.SetCookie(w, sessionCookie(r, "yyb_admin", token, expiry))
 			writeJSON(w, http.StatusOK, gin.H{"ok": true, "redirect": "/admin"})
 		} else {
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
@@ -371,14 +364,9 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		a.webAuth.DestroyAdminSession(cookie.Value)
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "yyb_admin",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
+	clearCookie := sessionCookie(r, "yyb_admin", "", time.Now())
+	clearCookie.MaxAge = -1
+	http.SetCookie(w, clearCookie)
 	writeJSON(w, http.StatusOK, gin.H{"ok": true, "redirect": "/login"})
 }
 
@@ -530,16 +518,9 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 		// Create a user session and set cookie for the scanning user.
 		userToken, err := a.db.CreateUserSession(r.Context(), acc.ID, 7*24*time.Hour)
 		if err == nil && userToken != "" {
-			http.SetCookie(w, &http.Cookie{
-				Name:     "yyb_user",
-				Value:    userToken,
-				Path:     "/",
-				Expires:  time.Now().Add(7 * 24 * time.Hour),
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-			})
+			http.SetCookie(w, sessionCookie(r, "yyb_user", userToken, time.Now().Add(7*24*time.Hour)))
 		}
-		resp := gin.H{"account": acc.Public(), "session_token": userToken, "redirect": "/my"}
+		resp := gin.H{"account": acc.Public(), "redirect": "/my"}
 		writeJSON(w, http.StatusOK, resp)
 	default:
 		writeError(w, http.StatusNotFound, "qr session not found")
@@ -1224,4 +1205,26 @@ func (a *App) handleMyAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.serveAvatar(w, r, acc)
+}
+
+func sessionCookie(r *http.Request, name, value string, expires time.Time) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		Secure:   isHTTPSRequest(r),
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+func isHTTPSRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }

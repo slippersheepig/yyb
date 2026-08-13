@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"yyb_go/internal/store"
@@ -15,9 +18,9 @@ import (
 
 // JDCheckResult is the result returned to the frontend after a JD verification attempt.
 type JDCheckResult struct {
-	Status       string `json:"status"`              // "ok", "risk", "error"
-	Message      string `json:"message,omitempty"`   // human-readable message
-	RiskURL      string `json:"risk_url,omitempty"`  // JD risk verification URL
+	Status       string `json:"status"`             // "ok", "risk", "error"
+	Message      string `json:"message,omitempty"`  // human-readable message
+	RiskURL      string `json:"risk_url,omitempty"` // JD risk verification URL
 	RiskExpireAt int64  `json:"risk_expire_at,omitempty"`
 	PTKey        string `json:"pt_key,omitempty"`
 	Pin          string `json:"pt_pin,omitempty"`
@@ -57,6 +60,11 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 		}, fmt.Errorf("autopost URL not configured")
 	}
 
+	autopostURL, err := validatedAutopostURL(a.cfg.AutopostURL)
+	if err != nil {
+		return JDCheckResult{Status: "error", Message: "autopost 服务地址配置不安全或无效"}, err
+	}
+
 	// Build the yyb server URL that autopost will call back to.
 	// Use the configured WebDomain if set, otherwise fall back to the
 	// server's own listening address.
@@ -75,8 +83,9 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 
 	bodyBytes, _ := json.Marshal(reqBody)
 
+	autopostURL.Path = strings.TrimRight(autopostURL.Path, "/") + "/api/jd-check"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		a.cfg.AutopostURL+"/api/jd-check", bytes.NewReader(bodyBytes))
+		autopostURL.String(), bytes.NewReader(bodyBytes))
 	if err != nil {
 		return JDCheckResult{Status: "error", Message: "构建 autopost 请求失败"}, err
 	}
@@ -107,7 +116,7 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[autopost] HTTP %d: %s", resp.StatusCode, string(respBody))
+		log.Printf("[autopost] HTTP %d: response body length=%d", resp.StatusCode, len(respBody))
 		return JDCheckResult{
 			Status:  "error",
 			Message: fmt.Sprintf("autopost 返回 HTTP %d", resp.StatusCode),
@@ -160,6 +169,29 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 	}
 
 	return result, nil
+}
+
+func validatedAutopostURL(rawURL string) (*url.URL, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLocalhost(u.Hostname())) {
+		return nil, fmt.Errorf("autopost URL must use https, except localhost development URLs")
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("autopost URL host is required")
+	}
+	return u, nil
+}
+
+func isLocalhost(host string) bool {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // parseCookieValue extracts a key=value pair from a cookie string like
