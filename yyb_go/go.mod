@@ -1,6 +1,6 @@
 module yyb_go
 
-go 1.27.0
+go 1.27.1
 
 require (
 	github.com/gin-gonic/gin v1.10.1
