@@ -229,7 +229,53 @@
       return isEnv ? d.data : d;
     }
 
-    // ── 京东验证 ──
+    // ── 处理结果展示 ──
+    function displayJdResult(resp, btnId, defaultBtnText) {
+      const result = $('jdResult');
+      if (resp.status === 'ok') {
+        result.className = 'jd-result ok';
+        result.style.display = 'block';
+        result.innerHTML = `<div class="jd-title">✅ ${escapeHTML(resp.message || '操作成功')}</div>` +
+          (resp.pt_pin ? `<div>账号：${escapeHTML(resp.pt_pin)}</div>` : '');
+        if (resp.jd_cookie) {
+          _jdCk = resp.jd_cookie;
+          const copyBtn = $('copyCkBtn');
+          if (copyBtn) copyBtn.style.display = 'inline-block';
+        }
+      } else if (resp.status === 'risk') {
+        result.className = 'jd-result risk';
+        result.style.display = 'block';
+        const expireNote = resp.risk_expire_at
+          ? `（链接将在 ${new Date(resp.risk_expire_at * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'})} 失效）`
+          : '（链接 30 分钟内有效）';
+        result.innerHTML = `<div class="jd-title">⚠️ ${escapeHTML(resp.message || '需要风险认证')}</div>` +
+          `<div>请点击下方链接在新窗口中完成认证，完成后回到本页点击「重新验证」${escapeHTML(expireNote)}</div>` +
+          `<a class="jd-link" href="${escapeHTML(resp.risk_url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(resp.risk_url)}</a>`;
+      } else {
+        result.className = 'jd-result error';
+        result.style.display = 'block';
+        result.innerHTML = `<div class="jd-title">❌ ${escapeHTML(resp.message || '操作失败')}</div>`;
+      }
+      const btn = $(btnId);
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = defaultBtnText;
+      }
+    }
+
+    function displayJdError(e, btnId, defaultBtnText) {
+      const result = $('jdResult');
+      result.className = 'jd-result error';
+      result.style.display = 'block';
+      result.innerHTML = `<div class="jd-title">❌ 请求失败</div><div>${escapeHTML(e.message || '未知错误')}</div>`;
+      const btn = $(btnId);
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = defaultBtnText;
+      }
+    }
+
+    // ── 京东验证 (Original Code path) ──
     let jdChecking = false;
 
     async function runJdCheck() {
@@ -240,56 +286,66 @@
       btn.disabled = true;
       btn.innerHTML = '<span class="jd-spinner"></span>正在验证...';
       result.style.display = 'none';
-      result.className = 'jd-result';
       try {
         const resp = await api('POST', '/api/my/jd-check');
-        if (resp.status === 'ok') {
-          result.className = 'jd-result ok';
-          result.style.display = 'block';
-          result.innerHTML = `<div class="jd-title">✅ ${escapeHTML(resp.message || '京东登录成功')}</div>` +
-            (resp.pt_pin ? `<div>账号：${escapeHTML(resp.pt_pin)}</div>` : '');
-          // 验证成功，持有CK并显示复制按钮
-          if (resp.jd_cookie) {
-            _jdCk = resp.jd_cookie;
-            const copyBtn = $('copyCkBtn');
-            if (copyBtn) copyBtn.style.display = 'inline-block';
-          }
-        } else if (resp.status === 'risk') {
-          result.className = 'jd-result risk';
-          result.style.display = 'block';
-          const expireNote = resp.risk_expire_at
-            ? `（链接将在 ${new Date(resp.risk_expire_at * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'})} 失效）`
-            : '（链接 30 分钟内有效）';
-          result.innerHTML = `<div class="jd-title">⚠️ ${escapeHTML(resp.message || '需要风险认证')}</div>` +
-            `<div>请点击下方链接在新窗口中完成认证，完成后回到本页点击「重新验证」${escapeHTML(expireNote)}</div>` +
-            `<a class="jd-link" href="${escapeHTML(resp.risk_url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(resp.risk_url)}</a>`;
-        } else {
-          result.className = 'jd-result error';
-          result.style.display = 'block';
-          result.innerHTML = `<div class="jd-title">❌ ${escapeHTML(resp.message || '验证失败')}</div>`;
-        }
+        displayJdResult(resp, 'jdBtn', '📱 原始验证 (Code登录)');
       } catch (e) {
-        result.className = 'jd-result error';
-        result.style.display = 'block';
-        result.innerHTML = `<div class="jd-title">❌ 请求失败</div><div>${escapeHTML(e.message || '未知错误')}</div>`;
+        displayJdError(e, 'jdBtn', '📱 原始验证 (Code登录)');
       } finally {
         jdChecking = false;
+      }
+    }
+
+    // ── WSKEY 转换验证 ──
+    async function runWskeyExchange() {
+      if (jdChecking) return;
+      jdChecking = true;
+      const btn = $('jdWskeyBtn');
+      const result = $('jdResult');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="jd-spinner"></span>正在转换...';
+      result.style.display = 'none';
+      try {
+        const resp = await api('POST', '/api/my/jd-wskey/exchange');
+        displayJdResult(resp, 'jdWskeyBtn', '🔑 WSKEY 转换验证 (推荐)');
+        setTimeout(loadMyStatus, 1000); // Reload status to update UI
+      } catch (e) {
+        displayJdError(e, 'jdWskeyBtn', '🔑 WSKEY 转换验证 (推荐)');
+      } finally {
+        jdChecking = false;
+      }
+    }
+
+    // ── 刷新 WSKEY ──
+    async function runWskeyRefresh() {
+      if (jdChecking) return;
+      jdChecking = true;
+      const btn = $('wskeyRefreshBtn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="jd-spinner"></span>获取中...';
+      try {
+        const resp = await api('POST', '/api/my/jd-wskey/refresh');
+        showToast('✅ WSKEY 刷新成功');
+        setTimeout(loadMyStatus, 500); // Reload status
+      } catch (e) {
+        showToast('❌ WSKEY 刷新失败: ' + (e.message || '未知错误'), true);
         btn.disabled = false;
-        btn.textContent = '重新验证京东登录';
+        btn.textContent = '🔄 从微信刷新获取 WSKEY';
+      } finally {
+        jdChecking = false;
       }
     }
 
     // ── 复制京东CK ──
     async function copyJdCk() {
       if (!_jdCk) {
-        showToast('请先点击「验证京东登录」', true);
+        showToast('请先点击「验证」', true);
         return;
       }
       try {
         await navigator.clipboard.writeText(_jdCk);
         showToast('✅ 京东CK已复制到剪贴板');
       } catch (e) {
-        // Fallback for non-HTTPS or older browsers
         const ta = document.createElement('textarea');
         ta.value = _jdCk;
         ta.style.position = 'fixed';
@@ -315,10 +371,8 @@
         const card = $('userCard');
         const name = acc.nickname || acc.alias || '微信用户';
 
-        // Build JD risk banner if there's a persisted risk URL (frontend expiry check)
         let riskBanner = '';
         if (acc.jd_risk_url) {
-          // Frontend expiry check: if jd_risk_expire_at is set and past, don't show the banner
           const now = Math.floor(Date.now() / 1000);
           const expired = acc.jd_risk_expire_at && acc.jd_risk_expire_at <= now;
           if (!expired) {
@@ -338,8 +392,28 @@
           riskBanner = `<div class="jd-result" id="jdResult"></div>`;
         }
 
-        // YYB不持久化CK，不从DB预加载
-        const showCopyBtn = '';
+        // Fetch WSKEY Status
+        let wskeyResp = { has_wskey: false, has_cookie: false };
+        try {
+          wskeyResp = await api('GET', '/api/my/jd-wskey/status');
+        } catch (err) {
+          console.warn("Failed to get wskey status", err);
+        }
+
+        let wskeyHtml = '';
+        if (wskeyResp) {
+           wskeyHtml = `
+          <div style="padding:16px 32px;border-top:1px solid #ebeef5;background:#fafbfc">
+            <div style="font-size:15px;font-weight:600;margin-bottom:12px;color:#303133">🔑 WSKEY 状态</div>
+            <div style="font-size:13px;color:#606266;margin-bottom:12px;line-height:1.6">
+              状态: <span style="font-weight:600;color:${wskeyResp.has_wskey ? '#67c23a' : '#909399'}">${wskeyResp.has_wskey ? '✅ 已获取' : '❌ 未获取'}</span>
+              ${wskeyResp.has_wskey ? `<br>预览: <span style="font-family:monospace;font-size:12px;background:#eee;padding:2px 4px;border-radius:4px">${escapeHTML(wskeyResp.wskey_preview || '***')}</span>` : ''}
+              ${wskeyResp.has_cookie ? `<br>有效转换: <span style="color:#67c23a">✅ 是</span> (pin=${escapeHTML(wskeyResp.pt_pin || '')})` : ''}
+            </div>
+            <button class="btn btn-ghost" style="padding:8px 16px;font-size:13px;width:100%" onclick="runWskeyRefresh()" id="wskeyRefreshBtn">🔄 从微信刷新获取 WSKEY</button>
+          </div>
+          `;
+        }
 
         card.innerHTML = `
           <div class="card-header">
@@ -374,11 +448,13 @@
             </div>
             ${riskBanner}
           </div>
-          <div class="card-footer">
-            <button class="btn btn-jd" id="jdBtn" onclick="runJdCheck()">验证京东登录</button>
-            <button class="btn btn-copy-ck" id="copyCkBtn" onclick="copyJdCk()"${showCopyBtn}>📋 复制京东CK</button>
-            <a class="btn btn-ghost" href="/scan">重新扫码</a>
-            ${resp.is_admin ? '<a class="btn btn-ghost" href="/admin" style="margin-top:8px">管理后台</a>' : ''}
+          ${wskeyHtml}
+          <div class="card-footer" style="padding-top:24px">
+            <button class="btn btn-jd" id="jdWskeyBtn" onclick="runWskeyExchange()">🔑 WSKEY 转换验证 (推荐)</button>
+            <button class="btn btn-ghost" id="jdBtn" onclick="runJdCheck()" style="width:100%;margin-bottom:12px">📱 原始验证 (Code登录)</button>
+            <button class="btn btn-copy-ck" id="copyCkBtn" onclick="copyJdCk()" style="display:none;width:100%;margin-bottom:12px">📋 复制京东CK</button>
+            <a class="btn btn-ghost" href="/scan" style="width:100%">重新扫码</a>
+            ${resp.is_admin ? '<a class="btn btn-ghost" href="/admin" style="width:100%;margin-top:12px">管理后台</a>' : ''}
           </div>
           <div id="wxBindSection" style="padding:20px 32px;border-top:1px solid #ebeef5">
             <div style="font-size:15px;font-weight:600;margin-bottom:12px;color:#303133">📱 微信通知绑定</div>
@@ -419,7 +495,6 @@
             <div id="wxQrArea" style="text-align:center"></div>
             <button class="btn btn-ghost" id="wxGenBtn" onclick="genBindCode()" style="margin-top:12px;width:100%">生成绑定码</button>
           `;
-          // 无论有没有bind_code，都显示公众号二维码
           showBindCode(resp.bind_code || '', resp.gzh_link, resp.gzh_name);
         }
       } catch (e) {
@@ -446,7 +521,6 @@
       const btn = $('wxGenBtn');
       if (btn) { btn.disabled = false; btn.textContent = '重新生成绑定码'; }
       const gzhDisplayName = gzhName || '3DS电影';
-      // 有绑定码时才显示绑定码区域
       if (codeArea && code) {
         codeArea.innerHTML = `
           <div style="font-size:12px;color:#909399;margin-bottom:6px">您的绑定码：</div>
@@ -454,7 +528,6 @@
           <div style="font-size:12px;color:#909399;text-align:center">在公众号发送「yyb 绑定 ${escapeHTML(code)}」完成绑定</div>
         `;
       }
-      // 始终显示公众号二维码和名称
       if (qrArea && gzhLink) {
         qrArea.innerHTML = `
           <div style="font-size:12px;color:#909399;margin-bottom:8px" id="wxQrLabel">扫码关注公众号「${escapeHTML(gzhDisplayName)}」</div>
@@ -465,7 +538,6 @@
       }
     }
 
-    // Delay loading bind status until card is rendered
     setTimeout(loadWxBindStatus, 500);
   </script>
 </body>
