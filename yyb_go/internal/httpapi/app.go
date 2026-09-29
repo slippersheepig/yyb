@@ -240,6 +240,10 @@ func (a *App) Handler() http.Handler {
 	userGroup.Any("/api/my/avatar", gin.WrapF(a.handleMyAvatar))
 	userGroup.Any("/api/my/jd-check", gin.WrapF(a.handleMyJdCheck))
 	userGroup.Any("/api/my/jd-cookie", gin.WrapF(a.handleMyJdCookie))
+	userGroup.Any("/api/my/jd-wskey", gin.WrapF(a.handleMyJdWskey))
+	userGroup.Any("/api/my/jd-wskey/refresh", gin.WrapF(a.handleJdWskeyRefresh))
+	userGroup.Any("/api/my/jd-wskey/exchange", gin.WrapF(a.handleMyJdWskeyExchange))
+	userGroup.Any("/api/my/jd-wskey/status", gin.WrapF(a.handleJdWskeyStatus))
 	userGroup.Any("/api/wx/bind-code", gin.WrapF(a.handleWxBindCode))
 	userGroup.Any("/api/wx/bind-status", gin.WrapF(a.handleWxBindStatus))
 
@@ -261,6 +265,7 @@ func (a *App) Handler() http.Handler {
 	protected.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
 	protected.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
 	protected.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
+	protected.Any("/wxapp/getJdWskey", gin.WrapF(a.handleJdWskeyGet))
 	protected.Any("/api/wx/push", gin.WrapF(a.handleWxPush))
 
 	router.NoRoute(func(c *gin.Context) {
