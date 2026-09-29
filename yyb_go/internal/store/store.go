@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS wechat_accounts (
     jd_risk_url      TEXT,
     jd_risk_expire_at INTEGER,
     jd_cookie        TEXT,
+    jd_wskey        TEXT,
     last_checked_at   INTEGER,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
@@ -114,6 +115,7 @@ type WechatAccount struct {
 	JdRiskURL      *string        `json:"jd_risk_url,omitempty"`
 	JdRiskExpireAt *int64         `json:"jd_risk_expire_at,omitempty"`
 	JdCookie       *string        `json:"jd_cookie,omitempty"`
+	JdWskey        *string        `json:"jd_wskey,omitempty"`
 	LastCheckedAt  *int64         `json:"last_checked_at,omitempty"`
 	CreatedAt      int64          `json:"created_at"`
 	UpdatedAt      int64          `json:"updated_at"`
@@ -130,6 +132,7 @@ type AccountPublic struct {
 	JdRiskURL      *string `json:"jd_risk_url,omitempty"`
 	JdRiskExpireAt *int64  `json:"jd_risk_expire_at,omitempty"`
 	JdCookie       *string `json:"jd_cookie,omitempty"`
+	JdWskey        *string `json:"jd_wskey,omitempty"`
 	LastCheckedAt  *int64  `json:"last_checked_at"`
 	CreatedAt      int64   `json:"created_at"`
 	UpdatedAt      int64   `json:"updated_at"`
@@ -221,6 +224,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = migrateJdCookieColumn(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateJdWskeyColumn(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -568,6 +575,65 @@ func (db *DB) SetJdCookie(ctx context.Context, id int64, ck string) error {
 	return err
 }
 
+// SetJdWskey stores the JD wskey for an account.
+func (db *DB) SetJdWskey(ctx context.Context, id int64, wskey string) error {
+	now := time.Now().Unix()
+	_, err := db.sql.ExecContext(ctx,
+		"UPDATE wechat_accounts SET jd_wskey=?, updated_at=? WHERE id=?",
+		wskey, now, id,
+	)
+	return err
+}
+
+// GetJdWskey retrieves the stored JD wskey for an account.
+func (db *DB) GetJdWskey(ctx context.Context, id int64) (string, error) {
+	var wskey sql.NullString
+	err := db.sql.QueryRowContext(ctx,
+		"SELECT jd_wskey FROM wechat_accounts WHERE id=?", id,
+	).Scan(&wskey)
+	if err != nil {
+		return "", err
+	}
+	if wskey.Valid {
+		return wskey.String, nil
+	}
+	return "", nil
+}
+
+// GetJdCookie retrieves the stored JD cookie for an account.
+func (db *DB) GetJdCookie(ctx context.Context, id int64) (string, error) {
+	var ck sql.NullString
+	err := db.sql.QueryRowContext(ctx,
+		"SELECT jd_cookie FROM wechat_accounts WHERE id=?", id,
+	).Scan(&ck)
+	if err != nil {
+		return "", err
+	}
+	if ck.Valid {
+		return ck.String, nil
+	}
+	return "", nil
+}
+
+// migrateJdWskeyColumn adds the jd_wskey column to existing wechat_accounts tables.
+func migrateJdWskeyColumn(ctx context.Context, db *sql.DB) error {
+	var colCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_table_info('wechat_accounts') WHERE name='jd_wskey'`,
+	).Scan(&colCount); err != nil {
+		return fmt.Errorf("check jd_wskey column: %w", err)
+	}
+	if colCount > 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `ALTER TABLE wechat_accounts ADD COLUMN jd_wskey TEXT`)
+	if err != nil {
+		return fmt.Errorf("add jd_wskey column: %w", err)
+	}
+	log.Printf("[migration] added jd_wskey column to wechat_accounts")
+	return nil
+}
+
 func (db *DB) DeleteAccount(ctx context.Context, id int64) error {
 	_, err := db.sql.ExecContext(ctx, "DELETE FROM wechat_accounts WHERE id=?", id)
 	return err
@@ -681,13 +747,14 @@ func (a *WechatAccount) Public() AccountPublic {
 		JdRiskURL:      a.JdRiskURL,
 		JdRiskExpireAt: a.JdRiskExpireAt,
 		JdCookie:       a.JdCookie,
+		JdWskey:        a.JdWskey,
 		LastCheckedAt:  a.LastCheckedAt,
 		CreatedAt:      a.CreatedAt,
 		UpdatedAt:      a.UpdatedAt,
 	}
 }
 
-const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, jd_risk_url, jd_risk_expire_at, jd_cookie, last_checked_at, created_at, updated_at FROM wechat_accounts`
+const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, jd_risk_url, jd_risk_expire_at, jd_cookie, jd_wskey, last_checked_at, created_at, updated_at FROM wechat_accounts`
 
 type accountScanner interface {
 	Scan(dest ...any) error
@@ -710,10 +777,11 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 		status, jdRiskURL       sql.NullString
 		jdRiskExpire            sql.NullInt64
 		jdCookie                sql.NullString
+		jdWskey                 sql.NullString
 	)
 	err := row.Scan(
 		&a.ID, &a.OpenID, &uin, &alias, &nickname, &avatar, &userJSON,
-		&a.LoginBuffer, &credJSON, &status, &jdRiskURL, &jdRiskExpire, &jdCookie, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
+		&a.LoginBuffer, &credJSON, &status, &jdRiskURL, &jdRiskExpire, &jdCookie, &jdWskey, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -730,6 +798,7 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 		a.JdRiskExpireAt = &jdRiskExpire.Int64
 	}
 	a.JdCookie = stringPtrFromNull(jdCookie)
+	a.JdWskey = stringPtrFromNull(jdWskey)
 	if lastChecked.Valid {
 		a.LastCheckedAt = &lastChecked.Int64
 	}
