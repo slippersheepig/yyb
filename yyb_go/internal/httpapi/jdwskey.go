@@ -189,10 +189,19 @@ func (a *App) retrieveJdWskeyFromGenToken(ctx context.Context, acc *store.Wechat
 	payload := map[string]any{
 		"api_name": "webapi",
 		"data": map[string]any{
-			"url":     "https://api.m.jd.com/client.action?functionId=genToken",
-			"method":  "POST",
-			"data":    map[string]any{"action": "from"},
-			"headers": map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+			"url":    "https://api.m.jd.com/client.action?functionId=genToken",
+			"method": "POST",
+			"data": map[string]any{
+				"action":        "from",
+				"appid":         "jd_android",
+				"client":        "android",
+				"clientVersion": "13.6.4",
+				"t":             fmt.Sprintf("%d", time.Now().UnixMilli()),
+			},
+			"headers": map[string]string{
+				"Content-Type": "application/x-www-form-urlencoded",
+				"User-Agent":   "JD4Android/13.6.4",
+			},
 		},
 		"env": 1,
 	}
