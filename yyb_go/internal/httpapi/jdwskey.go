@@ -150,7 +150,10 @@ func (a *App) handleMyJdWskey(w http.ResponseWriter, r *http.Request) {
 // 京东小程序登录后会将 wskey 写入 wx.Storage，key 为 "wskey"。
 func (a *App) retrieveJdWskeyFromStorage(ctx context.Context, acc *store.WechatAccount, appID string) (string, error) {
 	// 尝试多个可能的 storage key
-	storageKeys := []string{"wskey", "jd_wskey", "wskey_jd", "__wskey"}
+	storageKeys := []string{
+		"wskey", "jd_wskey", "wskey_jd", "__wskey", 
+		"JD_WSKEY", "jdWskey", "ws_key", "token", "tokenKey",
+	}
 
 	for _, key := range storageKeys {
 		payload := map[string]any{
@@ -186,18 +189,14 @@ func (a *App) retrieveJdWskeyFromStorage(ctx context.Context, acc *store.WechatA
 // 这是 JD 官方从当前登录会话导出令牌的接口。
 func (a *App) retrieveJdWskeyFromGenToken(ctx context.Context, acc *store.WechatAccount, appID string) (string, error) {
 	// 通过 operateWxData 调用 JD 的 genToken API
+	bodyStr := fmt.Sprintf("action=from&appid=jd_android&client=android&clientVersion=13.6.4&t=%d", time.Now().UnixMilli())
+	
 	payload := map[string]any{
 		"api_name": "webapi",
 		"data": map[string]any{
 			"url":    "https://api.m.jd.com/client.action?functionId=genToken",
 			"method": "POST",
-			"data": map[string]any{
-				"action":        "from",
-				"appid":         "jd_android",
-				"client":        "android",
-				"clientVersion": "13.6.4",
-				"t":             fmt.Sprintf("%d", time.Now().UnixMilli()),
-			},
+			"data":   bodyStr,
 			"headers": map[string]string{
 				"Content-Type": "application/x-www-form-urlencoded",
 				"User-Agent":   "JD4Android/13.6.4",
@@ -223,8 +222,10 @@ func (a *App) retrieveJdWskeyFromGenToken(ctx context.Context, acc *store.Wechat
 			return val, nil
 		}
 	}
-
-	return "", fmt.Errorf("genToken 响应中未找到 token/wskey")
+	
+	// 把京东返回的具体内容序列化成字符串，方便在 502 报错时直接展示给用户
+	resultJSON, _ := json.Marshal(result)
+	return "", fmt.Errorf("genToken 响应中未找到 token/wskey。京东原样返回: %s", string(resultJSON))
 }
 
 // ── handleJdWskeyRefresh ──
