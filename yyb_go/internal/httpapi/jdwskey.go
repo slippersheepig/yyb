@@ -277,8 +277,8 @@ func (a *App) handleJdWskeyImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "wskey is required")
 		return
 	}
-	if !strings.HasPrefix(wskey, "AAJ") {
-		writeError(w, http.StatusBadRequest, "wskey 格式异常（正常以 AAJ 开头），请确认是京东 APP 抓包得到的 wskey")
+	if !strings.Contains(wskey, "AAJ") {
+		writeError(w, http.StatusBadRequest, "凭证格式异常（应含 wskey=AAJ…，完整形如：pin=你的pin;wskey=AAJ…；京东APP抓包或 Stream 获取）")
 		return
 	}
 
