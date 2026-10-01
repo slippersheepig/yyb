@@ -322,7 +322,7 @@
       const btn = $('wskeyImportBtn');
       const wskey = ((input && input.value) || '').trim();
       if (!wskey) { showToast('请先粘贴 WSKEY', true); return; }
-      if (wskey.indexOf('AAJ') !== 0) { showToast('WSKEY 格式不对，应以 AAJ 开头', true); return; }
+      if (wskey.indexOf('AAJ') === -1) { showToast('凭证里没有 AAJ…，请确认为京东APP抓包的 pin=…;wskey=AAJ…', true); return; }
       if (btn) { btn.disabled = true; btn.textContent = '录入中…'; }
       try {
         const resp = await api('POST', '/api/my/jd-wskey/import', { wskey });
@@ -434,11 +434,11 @@
               ${wskeyResp.has_cookie ? `<br>有效转换: <span style="color:#67c23a">✅ 是</span> (pin=${escapeHTML(wskeyResp.pt_pin || '')})` : ''}
             </div>
             <div style="display:flex;gap:8px">
-              <input id="wskeyInput" type="text" placeholder="粘贴京东 APP 抓包的 WSKEY（AAJ 开头）" style="flex:1;min-width:0;padding:8px 10px;font-size:12px;border:1px solid #dcdfe6;border-radius:6px;font-family:monospace" />
+              <input id="wskeyInput" type="text" placeholder="粘贴京东APP抓包的凭证：pin=你的pin;wskey=AAJ…" style="flex:1;min-width:0;padding:8px 10px;font-size:12px;border:1px solid #dcdfe6;border-radius:6px;font-family:monospace" />
               <button class="btn btn-ghost" style="padding:8px 14px;font-size:13px;white-space:nowrap" onclick="importWskey()" id="wskeyImportBtn">📥 录入</button>
             </div>
             <div style="font-size:12px;color:#909399;margin-top:8px;line-height:1.5">
-              ⚠️ 微信扫码侧无法获取 wskey（京东 APP 的 wskey 不写进小程序 storage）。请用京东 APP 抓包（VNET / Stream）取得后粘贴于此，录入即自动验活并生成 30 天有效期 cookie。
+              ⚠️ 微信扫码侧无法获取 wskey（京东APP 的 wskey 不写进小程序 storage）。请用京东 APP 抓包（VNET / Stream）取到形如 <code>pin=你的pin;wskey=AAJ…</code> 后粘此，录入即自动验活并生成 30 天 app_open cookie。
             </div>
           </div>
           `;
