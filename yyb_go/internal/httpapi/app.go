@@ -242,6 +242,7 @@ func (a *App) Handler() http.Handler {
 	userGroup.Any("/api/my/jd-cookie", gin.WrapF(a.handleMyJdCookie))
 	userGroup.Any("/api/my/jd-wskey", gin.WrapF(a.handleMyJdWskey))
 	userGroup.Any("/api/my/jd-wskey/import", gin.WrapF(a.handleJdWskeyImport))
+	userGroup.Any("/api/my/jd-wskey/verify", gin.WrapF(a.handleJdWskeyVerify))
 	userGroup.Any("/api/my/jd-wskey/refresh", gin.WrapF(a.handleJdWskeyRefresh))
 	userGroup.Any("/api/my/jd-wskey/exchange", gin.WrapF(a.handleMyJdWskeyExchange))
 	userGroup.Any("/api/my/jd-wskey/status", gin.WrapF(a.handleJdWskeyStatus))
