@@ -327,15 +327,31 @@
       try {
         const resp = await api('POST', '/api/my/jd-wskey/import', { wskey });
         if (resp && resp.verified) {
-          showToast('✅ 录入成功并已验活（pin=' + (resp.pt_pin || '') + '）');
+          showToast(resp.message || ('✅ 录入成功并验活（pin=' + (resp.pt_pin || '') + '）'));
         } else {
-          showToast('✅ 已保存，但未验活成功（请检查 jdback 配置或 wskey 是否有效）', true);
+          showToast(resp && resp.message ? resp.message : '✅ 已保存，但未验活成功（wskey 可能已失效）', true);
         }
         if (input) input.value = '';
         setTimeout(loadMyStatus, 800);
       } catch (e) {
         showToast('❌ 录入失败: ' + (e.message || '未知错误'), true);
         if (btn) { btn.disabled = false; btn.textContent = '📥 录入'; }
+      }
+    }
+
+    // ── 验证已录入的 WSKEY（拿不到有效 cookie 就明确报失败）──
+    async function verifyWskey() {
+      const btn = $('wskeyVerifyBtn');
+      if (btn) { btn.disabled = true; btn.textContent = '验证中…'; }
+      try {
+        const resp = await api('POST', '/api/my/jd-wskey/verify');
+        const ok = !!(resp && resp.ok);
+        showToast((resp && resp.message) ? resp.message : (ok ? '✅ 验证成功' : '❌ 验证失败：拿不到有效 cookie'), !ok);
+        setTimeout(loadMyStatus, 800);
+      } catch (e) {
+        showToast('❌ 验证失败: ' + (e.message || '未知错误'), true);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '✅ 验证'; }
       }
     }
 
@@ -434,11 +450,12 @@
               ${wskeyResp.has_cookie ? `<br>有效转换: <span style="color:#67c23a">✅ 是</span> (pin=${escapeHTML(wskeyResp.pt_pin || '')})` : ''}
             </div>
             <div style="display:flex;gap:8px">
-              <input id="wskeyInput" type="text" placeholder="粘贴京东APP抓包的凭证：pin=你的pin;wskey=AAJ…;" style="flex:1;min-width:0;padding:8px 10px;font-size:12px;border:1px solid #dcdfe6;border-radius:6px;font-family:monospace" />
+              <input id="wskeyInput" type="text" placeholder="粘贴京东APP抓包的凭证：pin=你的pin;wskey=AAJ…" style="flex:1;min-width:0;padding:8px 10px;font-size:12px;border:1px solid #dcdfe6;border-radius:6px;font-family:monospace" />
               <button class="btn btn-ghost" style="padding:8px 14px;font-size:13px;white-space:nowrap" onclick="importWskey()" id="wskeyImportBtn">📥 录入</button>
+              <button class="btn btn-ghost" style="padding:8px 14px;font-size:13px;white-space:nowrap" onclick="verifyWskey()" id="wskeyVerifyBtn">✅ 验证</button>
             </div>
             <div style="font-size:12px;color:#909399;margin-top:8px;line-height:1.5">
-              ⚠️ 请用京东APP抓包工具（VNET/Stream）取到形如 <code>pin=你的pin;wskey=AAJ…;</code> （注意末尾保留分号）后粘贴于此。
+              ⚠️ 微信扫码侧无法获取 wskey（京东APP 的 wskey 不写进小程序 storage）。请用京东 APP 抓包（VNET / Stream）取到形如 <code>pin=你的pin;wskey=AAJ…</code> 后粘此，录入即自动验活并生成 30 天 app_open cookie。
             </div>
           </div>
           `;
