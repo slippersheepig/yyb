@@ -299,22 +299,91 @@ func (a *App) handleJdWskeyImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 录入后立即调 jdback 验活：确认 wskey 能换出 30 天 app_open pt_key。
+	// 录入后立即尝试验活：能换出有效 cookie 才算验证通过。
+	// 注意：wskey 失效时仍然保存成功（saved=true），只是 verified=false，
+	// 并附带失败原因；用户也可随后点「验证」重新检查。
 	result := map[string]any{
 		"openid":   acc.OpenID,
 		"saved":    true,
 		"verified": false,
+		"message":  "已保存，但未能换出有效 cookie（wskey 可能已失效/无效），请点「验证」重试",
 	}
-	if exchange, exErr := a.callJdbackWskeyExchange(r.Context(), wskey); exErr == nil && exchange.Status == "ok" {
+	if exchange, exErr := a.callJdbackWskeyExchange(r.Context(), wskey); exErr == nil && exchange.Status == "ok" && exchange.JdCookie != "" {
 		result["verified"] = true
 		result["pt_pin"] = exchange.PtPin
 		result["pt_key_type"] = "app_open"
-		if exchange.JdCookie != "" {
-			_ = a.db.SetJdCookie(r.Context(), acc.ID, exchange.JdCookie)
-		}
+		result["message"] = "✅ 录入成功，已验活（pt_pin=" + exchange.PtPin + "）"
+		_ = a.db.SetJdCookie(r.Context(), acc.ID, exchange.JdCookie)
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// ── handleJdWskeyVerify ──
+// POST /api/my/jd-wskey/verify
+// 读取已保存的 wskey 重新验活；换不出有效 cookie 时明确告知失败。
+func (a *App) handleJdWskeyVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	token, _ := getCookie(r, "yyb_user")
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	sess, err := a.db.GetUserSession(r.Context(), token)
+	if err != nil || sess == nil {
+		writeError(w, http.StatusUnauthorized, "会话已过期")
+		return
+	}
+	var body struct {
+		Ref string `json:"ref"`
+	}
+	_ = decodeOptionalJSON(r, &body)
+
+	var acc *store.WechatAccount
+	adminCookie, _ := getCookie(r, "yyb_admin")
+	if adminCookie != "" && a.webAuth.IsValidAdmin(adminCookie) && body.Ref != "" {
+		acc, err = a.db.ResolveAccount(r.Context(), body.Ref)
+	} else {
+		acc, err = a.db.GetAccount(r.Context(), sess.WechatAccountID)
+	}
+	if err != nil || acc == nil {
+		writeError(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+
+	wskey, err := a.db.GetJdWskey(r.Context(), acc.ID)
+	if err != nil || strings.TrimSpace(wskey) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"openid": acc.OpenID, "ok": false,
+			"message": "❌ 验证失败：还没有录入 wskey",
+		})
+		return
+	}
+
+	exchange, exErr := a.callJdbackWskeyExchange(r.Context(), wskey)
+	if exErr != nil || exchange.Status != "ok" || exchange.JdCookie == "" {
+		msg := strings.TrimSpace(exchange.Message)
+		if msg == "" && exErr != nil {
+			msg = exErr.Error()
+		}
+		detail := ""
+		if msg != "" {
+			detail = "：" + msg
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"openid": acc.OpenID, "ok": false,
+			"message": "❌ 验证失败：拿不到有效 cookie（wskey 已失效或无效）" + detail,
+		})
+		return
+	}
+	_ = a.db.SetJdCookie(r.Context(), acc.ID, exchange.JdCookie)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"openid": acc.OpenID, "ok": true, "pt_pin": exchange.PtPin,
+		"message": "✅ 验证成功，cookie 有效（pt_pin=" + exchange.PtPin + "）",
+	})
 }
 
 // ── handleJdWskeyRefresh ──
