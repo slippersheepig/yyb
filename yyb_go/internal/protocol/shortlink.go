@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"time"
 )
 
@@ -112,8 +113,9 @@ func send0RTTRaw(ctx context.Context, target Target, entry pskEntry, recvKey, en
 	if err != nil {
 		return nil, nil, err
 	}
-	_, responseBody := splitHTTP(raw)
+	head, responseBody := splitHTTP(raw)
 	if len(responseBody) == 0 {
+		log.Printf("[0RTT] ShortLink 响应体为空: head=%s", head)
 		return nil, nil, fmt.Errorf("empty ShortLink response")
 	}
 	return parse0RTTResponse(responseBody, psk, pskCH, type8, recvKey)
@@ -123,7 +125,8 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 	recs, _ := parseRecords(rbody)
 	var sh []byte
 	var encHS [][]byte
-	var appdata []byte
+	var allAppData [][]byte
+
 	for _, r := range recs {
 		if r.ContentType == ctHandshake {
 			if sh == nil {
@@ -131,35 +134,78 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 			}
 			encHS = append(encHS, r.Payload)
 		}
-		if r.ContentType == ctAppData && appdata == nil {
-			appdata = r.Payload
+		if r.ContentType == ctAppData {
+			allAppData = append(allAppData, r.Payload)
 		}
 	}
-	if sh == nil || appdata == nil {
-		return nil, nil, fmt.Errorf("response missing ServerHello/AppData")
+
+	if sh == nil || len(allAppData) == 0 {
+		return nil, nil, fmt.Errorf("response missing ServerHello/AppData (recs=%d, sh=%v, appdata=%d)", len(recs), sh != nil, len(allAppData))
 	}
+
 	candidates := [][]byte{
 		bytes.Join([][]byte{pskCH, sh}, nil),
 		bytes.Join([][]byte{pskCH, type8, sh}, nil),
 		bytes.Join([][]byte{pskCH, sh, type8}, nil),
 	}
-	for _, trans := range candidates {
-		h := sha256.Sum256(trans)
-		hk := derivePSKOneWayKeys(psk, labelHandshakeKeys, h[:])
-		for _, seq := range []uint64{2, 1, 3} {
-			ad, err := decryptRecordPayload(hk.Key, hk.IV, seq, ctAppData, appdata)
-			if err != nil {
-				continue
-			}
-			if sl, err := parseShortlink(ad); err == nil {
-				if resp, err := sessionDecrypt(sl.Body, recvKey); err == nil {
-					return extractCode(resp), resp, nil
+	if len(encHS) > 1 {
+		var joinedHS []byte
+		for _, h := range encHS {
+			joinedHS = append(joinedHS, h...)
+		}
+		candidates = append(candidates,
+			bytes.Join([][]byte{pskCH, joinedHS}, nil),
+			bytes.Join([][]byte{pskCH, type8, joinedHS}, nil),
+			bytes.Join([][]byte{pskCH, joinedHS, type8}, nil),
+		)
+	}
+
+	labels := [][]byte{
+		labelHandshakeKeys,
+		labelAppDataKeys,
+		labelEarlyKeys,
+	}
+
+	seqs := []uint64{2, 1, 0, 3, 4, 5, 6, 7}
+
+	for _, appdata := range allAppData {
+		for _, trans := range candidates {
+			h := sha256.Sum256(trans)
+			for _, label := range labels {
+				hk := derivePSKOneWayKeys(psk, label, h[:])
+				for _, seq := range seqs {
+					ad, err := decryptRecordPayload(hk.Key, hk.IV, seq, ctAppData, appdata)
+					if err != nil {
+						continue
+					}
+					// 成功解密 AppData，尝试解析短连接与业务会话
+					if sl, err := parseShortlink(ad); err == nil {
+						if resp, err := sessionDecrypt(sl.Body, recvKey); err == nil {
+							code := extractCode(resp)
+							if len(code) == 0 {
+								code = findCodeInPB(resp)
+							}
+							if len(code) > 0 {
+								return code, resp, nil
+							}
+							return nil, resp, nil
+						}
+					}
+					if resp, err := sessionDecrypt(ad, recvKey); err == nil {
+						code := extractCode(resp)
+						if len(code) == 0 {
+							code = findCodeInPB(resp)
+						}
+						if len(code) > 0 {
+							return code, resp, nil
+						}
+						return nil, resp, nil
+					}
 				}
-			}
-			if resp, err := sessionDecrypt(ad, recvKey); err == nil {
-				return extractCode(resp), resp, nil
 			}
 		}
 	}
+
+	log.Printf("[0RTT] parse0RTTResponse AppData 解密失败: records=%d, encHS=%d, appData=%d", len(recs), len(encHS), len(allAppData))
 	return nil, nil, fmt.Errorf("AppData decrypt/parse failed")
 }
