@@ -248,9 +248,12 @@
         const expireNote = resp.risk_expire_at
           ? `（链接将在 ${new Date(resp.risk_expire_at * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'})} 失效）`
           : '（链接 30 分钟内有效）';
-        result.innerHTML = `<div class="jd-title">⚠️ ${escapeHTML(resp.message || '需要风险认证')}</div>` +
-          `<div>请点击下方链接在新窗口中完成认证，完成后回到本页点击「重新验证」${escapeHTML(expireNote)}</div>` +
-          `<a class="jd-link" href="${escapeHTML(resp.risk_url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(resp.risk_url)}</a>`;
+        const hasUrl = resp.risk_url && String(resp.risk_url).trim();
+        const linkHtml = hasUrl
+          ? `<div>请点击下方链接在新窗口中完成认证，完成后回到本页点击「重新验证」${escapeHTML(expireNote)}</div>` +
+            `<a class="jd-link" href="${escapeHTML(resp.risk_url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(resp.risk_url)}</a>`
+          : `<div style="margin-top:6px;color:#f56c6c">（未获取到有效认证链接，请在手机京东APP中退出账号重新登录，或点击上方重新扫码）</div>`;
+        result.innerHTML = `<div class="jd-title">⚠️ ${escapeHTML(resp.message || '需要风险认证')}</div>` + linkHtml;
       } else {
         result.className = 'jd-result error';
         result.style.display = 'block';
@@ -411,7 +414,7 @@
         const name = acc.nickname || acc.alias || '微信用户';
 
         let riskBanner = '';
-        if (acc.jd_risk_url) {
+        if (acc.jd_risk_url && String(acc.jd_risk_url).trim()) {
           const now = Math.floor(Date.now() / 1000);
           const expired = acc.jd_risk_expire_at && acc.jd_risk_expire_at <= now;
           if (!expired) {
