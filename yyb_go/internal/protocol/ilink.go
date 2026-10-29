@@ -476,9 +476,10 @@ func sessionDecrypt(body, recvKey []byte) ([]byte, error) {
 
 func findCodeInPB(data []byte) []byte {
 	F := pbParse(data)
-	for _, v := range F {
+	for k, v := range F {
 		if b, ok := v.([]byte); ok {
-			if len(b) >= 16 && len(b) <= 64 && isAlphanumeric(b) {
+			// 排除 openid（openid 带有 - 或 _，长度通常 28，而微信 code 是 32 位纯字母数字）
+			if k != 2 && len(b) == 32 && isCodeString(b) {
 				return b
 			}
 			if inner := findCodeInPB(b); len(inner) > 0 {
@@ -489,12 +490,12 @@ func findCodeInPB(data []byte) []byte {
 	return nil
 }
 
-func isAlphanumeric(b []byte) bool {
+func isCodeString(b []byte) bool {
 	if len(b) == 0 {
 		return false
 	}
 	for _, c := range b {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
 			return false
 		}
 	}
