@@ -442,7 +442,7 @@ func sessionDecrypt(body, recvKey []byte) ([]byte, error) {
 	if _, _, hlen, err := decodeWpkgHead(body); err == nil {
 		offsets = append(offsets, hlen)
 	}
-	limit := min(len(body), 220)
+	limit := min(len(body), 512)
 	for i := 0; i < limit; i++ {
 		offsets = append(offsets, i)
 	}
@@ -460,12 +460,45 @@ func sessionDecrypt(body, recvKey []byte) ([]byte, error) {
 		if err != nil {
 			continue
 		}
-		pt, err := lz4Decompress(comp)
-		if err == nil {
+		// 优先尝试 LZ4 解压
+		if pt, err := lz4Decompress(comp); err == nil {
 			return pt, nil
+		}
+		// 若未做 LZ4 压缩，直接验证是否是有效 protobuf 明文
+		if len(comp) > 0 {
+			if F := pbParse(comp); len(F) > 0 {
+				return comp, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("response decrypt failed")
+}
+
+func findCodeInPB(data []byte) []byte {
+	F := pbParse(data)
+	for _, v := range F {
+		if b, ok := v.([]byte); ok {
+			if len(b) >= 16 && len(b) <= 64 && isAlphanumeric(b) {
+				return b
+			}
+			if inner := findCodeInPB(b); len(inner) > 0 {
+				return inner
+			}
+		}
+	}
+	return nil
+}
+
+func isAlphanumeric(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func extractCode(resp []byte) []byte {
