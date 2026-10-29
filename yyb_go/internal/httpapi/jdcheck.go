@@ -149,10 +149,17 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 
 	case "risk":
-		result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
-		result.Message = "京东返回二验，请点击下方链接完成认证后重新验证\n如返回无效链接，则需在手机重新登录京东APP"
 		if apResp.RiskURL != "" {
+			result.RiskExpireAt = time.Now().Add(riskURLTTL).Unix()
+			result.Message = "京东返回二验，请点击下方链接完成认证后重新验证\n如返回无效链接，则需在手机重新登录京东APP"
 			_ = a.db.SetJdRiskURLWithExpiry(ctx, acc.ID, apResp.RiskURL, riskURLTTL)
+		} else {
+			result.Status = "error"
+			if apResp.Message != "" {
+				result.Message = apResp.Message
+			} else {
+				result.Message = "京东验证失败，未返回有效二验链接，请在手机重新登录京东APP后重试"
+			}
 		}
 
 	case "error", "":
