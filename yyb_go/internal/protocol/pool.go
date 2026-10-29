@@ -140,6 +140,12 @@ func (p *Pool) Invalidate(ctx context.Context, accountID int64, tcpProxy string)
 	return p.db.InvalidateSession(ctx, accountID, effectiveProxy(tcpProxy, p.cfg.TCPProxy))
 }
 
+func (p *Pool) CheckLiveness(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string) error {
+	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
+	_, err := p.state(ctx, loginBuffer, accountID, effective)
+	return err
+}
+
 func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, op func(context.Context, WmpfSession) (map[string]any, error)) (map[string]any, error) {
 	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
 	st, err := p.state(ctx, loginBuffer, accountID, effective)
