@@ -809,6 +809,8 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 	if err != nil {
 		return nil, err
 	}
+	// 重新扫码成功，清理上一轮残留的京东二验风险链接
+	_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 	// Notify Telegram admins about the new login.
 	if a.tgBot != nil && acc != nil {
 		ev := tgbot.NewLoginEvent{
