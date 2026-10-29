@@ -157,6 +157,9 @@ func (a *App) autoRefreshAll(ctx context.Context) {
 			continue
 		}
 		creds := protocol.CredentialsFromMap(acc.Credentials)
+		if creds.RefreshToken == "" {
+			continue // 无 refresh_token 无法通过 UAL 自动刷新，避免错误标记为 expired
+		}
 		// Only refresh if within the refresh window (close to expiry)
 		if creds.ExpiresAt > now+refreshWindow {
 			continue // Still plenty of time, skip
@@ -862,17 +865,24 @@ func (e accountExpiredError) Error() string { return "account expired: " + e.ope
 
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
 	proxy := a.cfg.TCPProxy
-	if _, err := a.db.GetSession(ctx, acc.ID, proxy); err == nil {
-		result, err := call(ctx, acc, appID, payload)
-		if err == nil {
-			return result, nil
-		}
-		_ = a.db.InvalidateSession(ctx, acc.ID, proxy)
+
+	// 1. 优先使用当前账号直接调用（pool.state 会优先复用已有 session，若无 session 会自动用 login_buffer 登录建立新 session）
+	result, err := call(ctx, acc, appID, payload)
+	if err == nil {
+		return result, nil
 	}
+
+	// 2. 调用失败，说明当前 session 或 login_buffer 确实失效，先清理失效 session
+	log.Printf("[invokeWXApp] 账号 %d (%s) 业务调用失败: %v，尝试刷新凭证", acc.ID, acc.OpenID, err)
+	_ = a.db.InvalidateSession(ctx, acc.ID, proxy)
+
+	// 3. 只有在业务调用真正失败后，才尝试刷新凭证
 	status := a.refreshLiveness(ctx, acc)
 	if status != "alive" {
 		return nil, accountExpiredError{openid: acc.OpenID}
 	}
+
+	// 4. 刷新成功后，重新获取账号（带新 login_buffer）并重试调用
 	fresh, err := a.db.GetAccount(ctx, acc.ID)
 	if err == nil && fresh != nil {
 		acc = fresh
