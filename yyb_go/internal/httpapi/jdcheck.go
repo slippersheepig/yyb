@@ -117,6 +117,13 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[autopost] HTTP %d: response body length=%d", resp.StatusCode, len(respBody))
+		var apErr autopostResponse
+		if err := json.Unmarshal(respBody, &apErr); err == nil && apErr.Message != "" {
+			return JDCheckResult{
+				Status:  "error",
+				Message: apErr.Message,
+			}, fmt.Errorf("autopost HTTP %d: %s", resp.StatusCode, apErr.Message)
+		}
 		return JDCheckResult{
 			Status:  "error",
 			Message: fmt.Sprintf("autopost 返回 HTTP %d", resp.StatusCode),
@@ -145,6 +152,12 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 		result.PTKey = parseCookieValue(apResp.JdCookie, "pt_key")
 		if result.Pin == "" {
 			result.Pin = parseCookieValue(apResp.JdCookie, "pt_pin")
+		}
+		if result.Pin == "" {
+			result.Pin = parseCookieValue(apResp.JdCookie, "pin")
+		}
+		if result.Pin == "" {
+			result.Pin = parseCookieValue(apResp.JdCookie, "jdpin")
 		}
 		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 
@@ -275,6 +288,27 @@ func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, _ := a.callAutopost(r.Context(), acc)
+
+	if result.Status == "error" {
+		// Fallback: 如果账号存有 wskey，尝试自动走 wskey 转 cookie 链路
+		if wskey, _ := a.db.GetJdWskey(r.Context(), acc.ID); strings.TrimSpace(wskey) != "" {
+			wsResult, wsErr := a.callJdbackWskeyExchange(r.Context(), strings.TrimSpace(wskey))
+			if wsErr == nil && wsResult.Status == "ok" && wsResult.JdCookie != "" {
+				result = JDCheckResult{
+					Status:   "ok",
+					JdCookie: wsResult.JdCookie,
+					Message:  "成功获取京东 cookie",
+					Pin:      wsResult.PtPin,
+					PTKey:    parseCookieValue(wsResult.JdCookie, "pt_key"),
+				}
+				if result.Pin == "" {
+					result.Pin = parseCookieValue(wsResult.JdCookie, "pt_pin")
+				}
+				_ = a.db.SetJdRiskURL(r.Context(), acc.ID, "")
+				_ = a.db.SetJdCookie(r.Context(), acc.ID, wsResult.JdCookie)
+			}
+		}
+	}
 
 	if result.Status == "error" {
 		result.Message += "\n您也可以尝试打开“京东购物”微信小程序，右下角点“我的”-右上角点“设置”-页面拉到底，点击“退出”，重新登录后返回此页面点击「重新扫码」。"
