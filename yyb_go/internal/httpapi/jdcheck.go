@@ -147,8 +147,6 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 
 	switch apResp.Status {
 	case "ok":
-		result.Message = "京东登录成功"
-		// Parse pt_key from cookie string for frontend display.
 		result.PTKey = parseCookieValue(apResp.JdCookie, "pt_key")
 		if result.Pin == "" {
 			result.Pin = parseCookieValue(apResp.JdCookie, "pt_pin")
@@ -159,7 +157,14 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 		if result.Pin == "" {
 			result.Pin = parseCookieValue(apResp.JdCookie, "jdpin")
 		}
-		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		if result.PTKey == "" {
+			result.Status = "error"
+			result.Message = "未获取到包含 pt_key 的有效京东 CK，请直接再次点击「原始验证」重试（无需重新扫码）"
+		} else {
+			result.Message = "京东登录成功"
+			result.JdCookie = fmt.Sprintf("pt_key=%s;pt_pin=%s;", result.PTKey, result.Pin)
+			_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		}
 
 	case "risk":
 		if apResp.RiskURL != "" {
@@ -311,7 +316,7 @@ func (a *App) handleMyJdCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if result.Status == "error" {
-		result.Message += "\n您也可以尝试打开“京东购物”微信小程序，右下角点“我的”-右上角点“设置”-页面拉到底，点击“退出”，重新登录后返回此页面点击「重新扫码」。"
+		result.Message += "\n提示：您的微信扫码凭证已在系统保存，通常无需重新扫码，直接再次点击「原始验证」重试即可；若多次尝试仍无 pt_key，可尝试在手机微信中打开一次“京东购物”小程序以激活账号登录态。"
 	}
 
 	// Push notification via WeChat if configured.
