@@ -232,27 +232,35 @@
     // ── 处理结果展示 ──
     function displayJdResult(resp, btnId, defaultBtnText) {
       const result = $('jdResult');
+      const copyBtn = $('copyCkBtn');
+
       if (resp.status === 'ok') {
-        const hasPtKey = /pt_key=[^;]+/.test(resp.jd_cookie || '');
-        if (!hasPtKey) {
-          result.className = 'jd-result error';
-          result.style.display = 'block';
-          result.innerHTML = `<div class="jd-title">⚠️ 未获取到包含 pt_key 的有效CK</div>` +
-            `<div style="margin-top:6px;color:#e6a23c">未取得有效格式，请直接再次点击下方「原始验证」重试（无需重新扫码）</div>`;
-          const copyBtn = $('copyCkBtn');
-          if (copyBtn) copyBtn.style.display = 'none';
-        } else {
+        const ckStr = String(resp.jd_cookie || '');
+        const keyMatch = /(?:^|[;,\s])pt_key=([^;,\s]+)/.exec(ckStr);
+        const pinMatch = /(?:^|[;,\s])(?:pt_pin|pin|jdpin)=([^;,\s]+)/.exec(ckStr);
+        const ptKey = keyMatch ? keyMatch[1] : '';
+        const ptPin = pinMatch ? pinMatch[1] : (resp.pt_pin || '');
+
+        // 仅当包含有效的 pt_key 时才展示成功与复制按钮
+        if (ptKey) {
+          _jdCk = `pt_key=${ptKey};pt_pin=${ptPin};`;
           result.className = 'jd-result ok';
           result.style.display = 'block';
           result.innerHTML = `<div class="jd-title">✅ ${escapeHTML(resp.message || '操作成功')}</div>` +
-            (resp.pt_pin ? `<div>账号：${escapeHTML(resp.pt_pin)}</div>` : '');
-          if (resp.jd_cookie) {
-            _jdCk = resp.jd_cookie;
-            const copyBtn = $('copyCkBtn');
-            if (copyBtn) copyBtn.style.display = 'inline-block';
-          }
+            (ptPin ? `<div>账号：${escapeHTML(ptPin)}</div>` : '');
+          if (copyBtn) copyBtn.style.display = 'inline-block';
+        } else {
+          // 未获取到 pt_key 时绝不展示复制按钮，直接提醒用户重新扫码
+          _jdCk = '';
+          if (copyBtn) copyBtn.style.display = 'none';
+          result.className = 'jd-result error';
+          result.style.display = 'block';
+          result.innerHTML = `<div class="jd-title">❌ 验证未获取到有效CK</div>` +
+            `<div style="margin-top:6px;color:#f56c6c;line-height:1.6">本次未生成包含 pt_key 的有效凭据，请点击下方「重新扫码」后重试。</div>`;
         }
       } else if (resp.status === 'risk') {
+        _jdCk = '';
+        if (copyBtn) copyBtn.style.display = 'none';
         result.className = 'jd-result risk';
         result.style.display = 'block';
         const expireNote = resp.risk_expire_at
@@ -265,13 +273,12 @@
           : `<div style="margin-top:6px;color:#f56c6c">（未获取到有效认证链接，请在手机京东APP中退出账号重新登录，或点击上方重新扫码）</div>`;
         result.innerHTML = `<div class="jd-title">⚠️ ${escapeHTML(resp.message || '需要风险认证')}</div>` + linkHtml;
       } else {
+        _jdCk = '';
+        if (copyBtn) copyBtn.style.display = 'none';
         result.className = 'jd-result error';
         result.style.display = 'block';
-        const msg = resp.message || '操作失败';
-        result.innerHTML = `<div class="jd-title">❌ ${escapeHTML(msg)}</div>` +
-          `<div style="margin-top:8px;font-size:12px;color:#909399;line-height:1.5">💡 提示：微信扫码凭据已由系统妥善保存，通常无需重新扫码，直接再次点击上方「原始验证」重试即可。</div>`;
-        const copyBtn = $('copyCkBtn');
-        if (copyBtn) copyBtn.style.display = 'none';
+        result.innerHTML = `<div class="jd-title">❌ ${escapeHTML(resp.message || '操作失败')}</div>` +
+          `<div style="margin-top:6px;color:#909399;font-size:12px">如多次失败，请点击下方「重新扫码」。</div>`;
       }
       const btn = $(btnId);
       if (btn) {
@@ -394,8 +401,8 @@
 
     // ── 复制京东CK ──
     async function copyJdCk() {
-      if (!_jdCk) {
-        showToast('请先点击「验证」', true);
+      if (!_jdCk || _jdCk.indexOf('pt_key=') === -1) {
+        showToast('CK格式无效或缺少 pt_key，请重新扫码', true);
         return;
       }
       try {
