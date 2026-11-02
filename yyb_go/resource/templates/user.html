@@ -233,14 +233,24 @@
     function displayJdResult(resp, btnId, defaultBtnText) {
       const result = $('jdResult');
       if (resp.status === 'ok') {
-        result.className = 'jd-result ok';
-        result.style.display = 'block';
-        result.innerHTML = `<div class="jd-title">✅ ${escapeHTML(resp.message || '操作成功')}</div>` +
-          (resp.pt_pin ? `<div>账号：${escapeHTML(resp.pt_pin)}</div>` : '');
-        if (resp.jd_cookie) {
-          _jdCk = resp.jd_cookie;
+        const hasPtKey = /pt_key=[^;]+/.test(resp.jd_cookie || '');
+        if (!hasPtKey) {
+          result.className = 'jd-result error';
+          result.style.display = 'block';
+          result.innerHTML = `<div class="jd-title">⚠️ 未获取到包含 pt_key 的有效CK</div>` +
+            `<div style="margin-top:6px;color:#e6a23c">未取得有效格式，请直接再次点击下方「原始验证」重试（无需重新扫码）</div>`;
           const copyBtn = $('copyCkBtn');
-          if (copyBtn) copyBtn.style.display = 'inline-block';
+          if (copyBtn) copyBtn.style.display = 'none';
+        } else {
+          result.className = 'jd-result ok';
+          result.style.display = 'block';
+          result.innerHTML = `<div class="jd-title">✅ ${escapeHTML(resp.message || '操作成功')}</div>` +
+            (resp.pt_pin ? `<div>账号：${escapeHTML(resp.pt_pin)}</div>` : '');
+          if (resp.jd_cookie) {
+            _jdCk = resp.jd_cookie;
+            const copyBtn = $('copyCkBtn');
+            if (copyBtn) copyBtn.style.display = 'inline-block';
+          }
         }
       } else if (resp.status === 'risk') {
         result.className = 'jd-result risk';
@@ -257,7 +267,11 @@
       } else {
         result.className = 'jd-result error';
         result.style.display = 'block';
-        result.innerHTML = `<div class="jd-title">❌ ${escapeHTML(resp.message || '操作失败')}</div>`;
+        const msg = resp.message || '操作失败';
+        result.innerHTML = `<div class="jd-title">❌ ${escapeHTML(msg)}</div>` +
+          `<div style="margin-top:8px;font-size:12px;color:#909399;line-height:1.5">💡 提示：微信扫码凭据已由系统妥善保存，通常无需重新扫码，直接再次点击上方「原始验证」重试即可。</div>`;
+        const copyBtn = $('copyCkBtn');
+        if (copyBtn) copyBtn.style.display = 'none';
       }
       const btn = $(btnId);
       if (btn) {
