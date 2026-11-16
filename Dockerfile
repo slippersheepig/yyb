@@ -1,4 +1,4 @@
-FROM golang:1.27.3-alpine AS builder
+FROM golang:1.27.4-alpine AS builder
 WORKDIR /app
 COPY yyb_go .
 RUN go mod download
