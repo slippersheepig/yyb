@@ -147,7 +147,6 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 
 	switch apResp.Status {
 	case "ok":
-		result.Message = "京东登录成功"
 		// Parse pt_key from cookie string for frontend display.
 		result.PTKey = parseCookieValue(apResp.JdCookie, "pt_key")
 		if result.Pin == "" {
@@ -159,7 +158,19 @@ func (a *App) callAutopost(ctx context.Context, acc *store.WechatAccount) (JDChe
 		if result.Pin == "" {
 			result.Pin = parseCookieValue(apResp.JdCookie, "jdpin")
 		}
-		_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		if result.PTKey == "" || result.Pin == "" {
+			result.Status = "error"
+			result.JdCookie = ""
+			if apResp.Message != "" && apResp.Message != "成功获取京东 cookie" {
+				result.Message = apResp.Message
+			} else {
+				result.Message = "京东仅返回小程序会话(skey/sfstoken)，未下发有效 pt_key"
+			}
+		} else {
+			result.JdCookie = fmt.Sprintf("pt_key=%s;pt_pin=%s;", result.PTKey, result.Pin)
+			result.Message = "京东登录成功"
+			_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+		}
 
 	case "risk":
 		if apResp.RiskURL != "" {
