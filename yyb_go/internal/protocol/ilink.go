@@ -9,9 +9,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -22,8 +25,10 @@ const (
 	jsLoginCmdID = 1029
 	phoneCmdID   = 1020
 	operateCmdID = 1133
+	h5OAuthCmdID = 1254
 
-	sessClientVer = 1661404927
+	sessClientVer   = 1661404927
+	h5OAuthMaxDepth = 8
 )
 
 var (
@@ -38,6 +43,7 @@ var (
 	jsLoginURL        = []byte("/cgi-bin/mmbiz-bin/js-login")
 	phoneURL          = []byte("/cgi-bin/mmbiz-bin/js-getuserwxphone")
 	operateURL        = []byte("/cgi-bin/mmbiz-bin/js-operatewxdata")
+	h5OAuthURL        = []byte("/cgi-bin/mmbiz-bin/oauth_authorize")
 	windowsPlugin     = []byte("WindowsxWebPlugin")
 	windowsName       = []byte("Windows")
 	unifiedPCWindows  = []byte("UnifiedPCWindows")
@@ -103,13 +109,13 @@ func buildManualAuthRequest(loginBufferB64 string, appDeviceID []byte) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	appBase := append(pbLen(1, appDeviceID), pbVar(2, appVersion)...)
+	appBase := pbLen(1, appDeviceID)
 	thirdApp := pbLen(1, meta.Ticket)
 	out := make([]byte, 0, len(appBase)+len(thirdApp)+32)
 	out = append(out, pbLen(1, appBase)...)
+	out = append(out, pbVar(2, appVersion)...)
 	out = append(out, pbLen(3, thirdApp)...)
 	out = append(out, pbVar(4, 4)...)
-	out = append(out, pbLen(6, nil)...)
 	out = append(out, pbVar(7, 0)...)
 	out = append(out, pbVar(8, 6)...)
 	return out, nil
@@ -570,4 +576,196 @@ func extractOperatePayload(raw map[string]any) map[string]any {
 		}
 	}
 	return raw
+}
+
+// ErrH5OAuthBusinessRejected reports an explicit non-zero business status from
+// the oauth_authorize CGI (command 1254).
+type ErrH5OAuthBusinessRejected struct {
+	Ret int32
+}
+
+func (e *ErrH5OAuthBusinessRejected) Error() string {
+	return fmt.Sprintf("h5 oauth rejected: business code=%d", e.Ret)
+}
+
+func buildH5OAuthAuthorizeURL(appID, redirectURI, scope, state string) (string, string, string, string, error) {
+	appID = strings.TrimSpace(appID)
+	if len(appID) != 18 || !strings.HasPrefix(appID, "wx") {
+		return "", "", "", "", fmt.Errorf("appid must be an 18-character WeChat AppID")
+	}
+	redirectURI = strings.TrimSpace(redirectURI)
+	if redirectURI == "" || len(redirectURI) > 2048 || strings.ContainsAny(redirectURI, "\r\n") {
+		return "", "", "", "", fmt.Errorf("redirect_uri is required")
+	}
+	u, err := url.Parse(redirectURI)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+		return "", "", "", "", fmt.Errorf("redirect_uri must be a valid absolute URL without fragment")
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return "", "", "", "", fmt.Errorf("redirect_uri must use http or https")
+	}
+	cleanRedirect := u.String()
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		scope = "snsapi_base"
+	}
+	if scope != "snsapi_base" && scope != "snsapi_userinfo" {
+		return "", "", "", "", fmt.Errorf("scope must be snsapi_base or snsapi_userinfo")
+	}
+	state = strings.TrimSpace(state)
+	if state == "" {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			return "", "", "", "", err
+		}
+		state = hex.EncodeToString(b)
+	}
+	if len(state) > 128 || strings.ContainsAny(state, "\r\n") {
+		return "", "", "", "", fmt.Errorf("state is invalid")
+	}
+	values := url.Values{}
+	values.Set("appid", appID)
+	values.Set("redirect_uri", cleanRedirect)
+	values.Set("response_type", "code")
+	values.Set("scope", scope)
+	values.Set("state", state)
+	base := "https://open.weixin.qq.com/connect/oauth2/authorize?" + values.Encode()
+	return cleanRedirect, base + "#wechat_redirect", scope, state, nil
+}
+
+func buildH5OAuthRequest(authorizeURL string) []byte {
+	base := pbLen(1, nil)
+	base = append(base, pbVar(2, 0)...)
+	base = append(base, pbLen(3, nil)...)
+	base = append(base, pbVar(4, 0)...)
+	base = append(base, pbLen(5, windowsName)...)
+	base = append(base, pbVar(6, 0)...)
+	body := pbLen(1, base)
+	body = append(body, pbLen(2, []byte(authorizeURL))...)
+	body = append(body, pbLen(3, nil)...)
+	return append(body, pbVar(4, 4)...)
+}
+
+type h5OAuthField struct {
+	wire int
+	n    uint64
+	b    []byte
+}
+
+func parseH5OAuthFields(raw []byte) (map[int]h5OAuthField, error) {
+	fields := map[int]h5OAuthField{}
+	for offset := 0; offset < len(raw); {
+		tag, next, err := readVarint(raw, offset)
+		if err != nil || tag>>3 == 0 {
+			return nil, errors.New("invalid protobuf tag")
+		}
+		offset = next
+		field := h5OAuthField{wire: int(tag & 7)}
+		switch field.wire {
+		case 0:
+			field.n, offset, err = readVarint(raw, offset)
+		case 2:
+			var size uint64
+			size, offset, err = readVarint(raw, offset)
+			if err == nil && size <= uint64(len(raw)-offset) {
+				field.b = raw[offset : offset+int(size)]
+				offset += int(size)
+			} else {
+				err = errors.New("invalid protobuf length")
+			}
+		default:
+			err = errors.New("unsupported protobuf wire")
+		}
+		if err != nil {
+			return nil, err
+		}
+		number := int(tag >> 3)
+		if _, duplicate := fields[number]; duplicate {
+			return nil, errors.New("duplicate protobuf field")
+		}
+		fields[number] = field
+	}
+	return fields, nil
+}
+
+func parseH5OAuthResult(raw []byte, callback, state string, depth int) (string, error) {
+	if depth > h5OAuthMaxDepth {
+		return "", errors.New("h5 oauth: response nesting limit")
+	}
+	fields, err := parseH5OAuthFields(raw)
+	if err != nil {
+		return "", err
+	}
+	location := ""
+	if field, ok := fields[6]; ok && field.wire == 2 {
+		location = string(field.b)
+	}
+	if strings.HasPrefix(location, "https://") || strings.HasPrefix(location, "http://") {
+		ret, retErr := h5OAuthBusinessStatus(fields)
+		if retErr != nil {
+			return "", retErr
+		}
+		if ret != 0 {
+			return "", &ErrH5OAuthBusinessRejected{Ret: ret}
+		}
+		return h5OAuthCallbackCode(location, callback, state)
+	}
+	if ret, retErr := h5OAuthBusinessStatus(fields); retErr == nil && ret != 0 {
+		return "", &ErrH5OAuthBusinessRejected{Ret: ret}
+	}
+	for number := 1; number <= 32; number++ {
+		field, exists := fields[number]
+		if !exists || field.wire != 2 {
+			continue
+		}
+		code, nestedErr := parseH5OAuthResult(field.b, callback, state, depth+1)
+		var rejected *ErrH5OAuthBusinessRejected
+		if errors.As(nestedErr, &rejected) {
+			return "", rejected
+		}
+		if nestedErr == nil {
+			return code, nil
+		}
+	}
+	return "", errors.New("h5 oauth: callback payload absent")
+}
+
+func h5OAuthBusinessStatus(fields map[int]h5OAuthField) (int32, error) {
+	base, ok := fields[1]
+	if !ok || base.wire != 2 {
+		return 0, errors.New("h5 oauth: missing explicit business status")
+	}
+	baseFields, err := parseH5OAuthFields(base.b)
+	if err != nil {
+		return 0, err
+	}
+	ret, ok := baseFields[1]
+	if !ok || ret.wire != 0 {
+		return 0, errors.New("h5 oauth: missing explicit business status")
+	}
+	return int32(ret.n), nil
+}
+
+func h5OAuthCallbackCode(location, callback, state string) (string, error) {
+	got, err := url.Parse(location)
+	if err != nil {
+		return "", errors.New("h5 oauth: callback location unparsable")
+	}
+	want, err := url.Parse(callback)
+	if err != nil {
+		return "", errors.New("h5 oauth: callback target unparsable")
+	}
+	if got.Scheme != want.Scheme || got.Host != want.Host || got.Path != want.Path || got.RawPath != want.RawPath || got.User != nil || got.Fragment != "" {
+		return "", errors.New("h5 oauth: callback target mismatch")
+	}
+	query, err := url.ParseQuery(got.RawQuery)
+	if err != nil || len(query["code"]) != 1 || query.Get("code") == "" || len(query["state"]) != 1 || query.Get("state") != state {
+		return "", errors.New("h5 oauth: callback code or state mismatch")
+	}
+	for key, values := range want.Query() {
+		if key == "code" || key == "state" || len(query[key]) != len(values) || strings.Join(query[key], "\x00") != strings.Join(values, "\x00") {
+			return "", errors.New("h5 oauth: callback query mismatch")
+		}
+	}
+	return query.Get("code"), nil
 }
