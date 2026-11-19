@@ -255,6 +255,8 @@ func (a *App) Handler() http.Handler {
 	protected.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
 	protected.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
 	protected.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
+	protected.Any("/wxapp/getH5Code", gin.WrapF(a.handleGetH5Code))
+	protected.Any("/wx/h5code", gin.WrapF(a.handleGetH5Code))
 	protected.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
 	protected.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
 	protected.Any("/api/wx/push", gin.WrapF(a.handleWxPush))
@@ -627,11 +629,86 @@ func (a *App) handleAccountResync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated.Public())
 }
 
+var builtinNonMiniProgramAppIDs = map[string]string{
+	"wx2f5d8f9715c59d10": "京东网页登录护照公众号",
+	"wx5cd60c5d4817a188": "腾讯电脑管家网站应用",
+}
+
 func (a *App) handleGetCode(w http.ResponseWriter, r *http.Request) {
 	if !acceptWXAppRoute(w, r, "/wxapp/getCode") {
 		return
 	}
 	a.callWXApp(w, r, false, a.invokeGetCode)
+}
+
+func (a *App) handleGetH5Code(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/wx/h5code" && r.URL.Path != "/wxapp/getH5Code" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Ref         string         `json:"ref"`
+		AppID       string         `json:"app_id"`
+		AppIDAlt    string         `json:"appid"`
+		RedirectURI string         `json:"redirect_uri"`
+		Scope       string         `json:"scope"`
+		State       string         `json:"state"`
+		Payload     map[string]any `json:"payload"`
+	}
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	appID := strings.TrimSpace(body.AppID)
+	if appID == "" {
+		appID = strings.TrimSpace(body.AppIDAlt)
+	}
+	redirectURI := strings.TrimSpace(body.RedirectURI)
+	scope := strings.TrimSpace(body.Scope)
+	state := strings.TrimSpace(body.State)
+	if body.Payload != nil {
+		if redirectURI == "" {
+			redirectURI = strings.TrimSpace(stringFromAny(body.Payload["redirect_uri"]))
+		}
+		if scope == "" {
+			scope = strings.TrimSpace(stringFromAny(body.Payload["scope"]))
+		}
+		if state == "" {
+			state = strings.TrimSpace(stringFromAny(body.Payload["state"]))
+		}
+	}
+	if strings.TrimSpace(body.Ref) == "" {
+		writeError(w, http.StatusBadRequest, "ref is required")
+		return
+	}
+	if appID == "" {
+		writeError(w, http.StatusBadRequest, "app_id is required")
+		return
+	}
+	if redirectURI == "" {
+		writeError(w, http.StatusBadRequest, "redirect_uri is required")
+		return
+	}
+	acc, ok := a.resolveAccountRef(w, r, body.Ref)
+	if !ok {
+		return
+	}
+	result, err := a.pool.GetH5Code(r.Context(), acc.LoginBuffer, appID, redirectURI, scope, state, acc.ID, a.cfg.TCPProxy)
+	if err != nil {
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "manualauth failed") || strings.Contains(errStr, "login_buffer is empty") || strings.Contains(errStr, "login_buffer expired") {
+			_ = a.db.SetAccountStatus(r.Context(), acc.ID, "expired")
+			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
+			return
+		}
+		writeError(w, http.StatusBadGateway, "h5code call failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"openid": acc.OpenID, "result": result})
 }
 
 func (a *App) handleGetPhoneNumber(w http.ResponseWriter, r *http.Request) {
@@ -700,6 +777,8 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 		switch {
 		case errors.As(err, &expired):
 			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
+		case strings.Contains(err.Error(), "non-miniprogram AppID"):
+			writeError(w, http.StatusForbidden, err.Error())
 		default:
 			writeError(w, http.StatusBadGateway, "call failed: "+err.Error())
 		}
@@ -864,6 +943,10 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	if err == nil {
 		return result, nil
 	}
+	// 空 code 或非小程序拦截属于上游业务拒绝，不能清理会话重复重放
+	if strings.Contains(err.Error(), "wx.login returned empty code") || strings.Contains(err.Error(), "non-miniprogram AppID") {
+		return nil, err
+	}
 
 	// 2. 调用失败，清理失效 session
 	log.Printf("[invokeWXApp] 账号 %d (%s) 业务调用失败: %v，清理失效会话并自动重试", acc.ID, acc.OpenID, err)
@@ -889,6 +972,10 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 }
 
 func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
+	normID := strings.ToLower(strings.TrimSpace(appID))
+	if label, denied := builtinNonMiniProgramAppIDs[normID]; denied {
+		return nil, errors.New("non-miniprogram AppID denied for /wxapp/getCode (" + label + "); use /wx/h5code instead")
+	}
 	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
 }
 
