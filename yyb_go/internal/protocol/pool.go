@@ -99,8 +99,52 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 		if err != nil {
 			return nil, err
 		}
+		if len(code) == 0 {
+			return nil, fmt.Errorf("wx.login returned empty code")
+		}
 		return map[string]any{"code": string(code), "errMsg": "login:ok"}, nil
 	})
+}
+
+func (p *Pool) GetH5Code(ctx context.Context, loginBuffer, appID, redirectURI, scope, state string, accountID int64, tcpProxy string) (map[string]any, error) {
+	callback, fullURL, resolvedScope, resolvedState, err := buildH5OAuthAuthorizeURL(appID, redirectURI, scope, state)
+	if err != nil {
+		return nil, err
+	}
+	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
+	st, err := p.state(ctx, loginBuffer, accountID, effective)
+	if err != nil && effective != "" && p.cfg.TCPProxyFallbackDirect {
+		st, err = p.state(ctx, loginBuffer, accountID, "")
+	}
+	if err != nil {
+		return nil, err
+	}
+	hostAppID := st.Session.HostAppID
+	if len(hostAppID) == 0 {
+		hostAppID = hostAppIDDefault
+	}
+	reqBytes := buildH5OAuthRequest(fullURL)
+	plain := buildJSAPIPlaintext(st.Session.UIN, appID, h5OAuthURL, h5OAuthCmdID, reqBytes, hostAppID, nil)
+	envelope, err := buildTransferPacket(st.Session, plain)
+	if err != nil {
+		return nil, err
+	}
+	_, reply, err := p.sendEnvelope(ctx, st, envelope)
+	if err != nil {
+		return nil, err
+	}
+	code, err := parseH5OAuthResult(reply, callback, resolvedState, 0)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"code":         code,
+		"appid":        appID,
+		"scope":        resolvedScope,
+		"state":        resolvedState,
+		"redirect_uri": callback,
+		"mode":         "h5_oauth_auto",
+	}, nil
 }
 
 func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
@@ -151,7 +195,7 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	st, err := p.state(ctx, loginBuffer, accountID, effective)
 	if err == nil {
 		res, err := op(ctx, st)
-		if err == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect {
+		if err == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect || err.Error() == "wx.login returned empty code" {
 			return res, err
 		}
 		_ = p.Invalidate(ctx, accountID, effective)
