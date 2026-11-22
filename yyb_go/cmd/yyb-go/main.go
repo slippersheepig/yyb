@@ -73,7 +73,7 @@ func main() {
 		ResourceRoot:   *resourceRoot,
 		DBFilename:     *dbFilename,
 		TCPProxy:       *tcpProxy,
-		SessionTTL:     30 * time.Minute,
+		SessionTTL:     6 * time.Hour,
 		RequestTimeout: 8 * time.Second,
 		AvatarTimeout:  10 * time.Second,
 		ScanTimeout:    180 * time.Second,
