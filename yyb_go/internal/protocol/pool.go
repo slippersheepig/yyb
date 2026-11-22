@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +29,7 @@ func DefaultConfig() Config {
 	return Config{
 		ShortlinkTimeout:        8 * time.Second,
 		LoginTimeout:            30 * time.Second,
-		SessionTTL:              30 * time.Minute,
+		SessionTTL:              6 * time.Hour,
 		DNSCacheTTL:             30 * time.Minute,
 		MaxShortlinkConcurrency: 1000,
 		MaxLoginConcurrency:     32,
@@ -268,6 +269,11 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 		return WmpfSession{}, fmt.Errorf("HTTPDNS LongLink failed: %w", err)
 	}
 	targets = orderLonglinkTargets(targets, 6)
+	meta, err := parseLoginBuffer(loginBuffer)
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	appDeviceID := stableAppDeviceID(meta.DeviceID)
 	var last error
 	for _, t := range targets {
 		mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
@@ -275,46 +281,48 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 			last = err
 			continue
 		}
-		defer mc.close()
-		meta, err := parseLoginBuffer(loginBuffer)
-		if err != nil {
-			return WmpfSession{}, err
-		}
-		appDeviceID, err := randomAppDeviceID()
-		if err != nil {
-			return WmpfSession{}, err
-		}
 		temp := &manualAuthTemp{}
 		body, err := buildLoginBody(loginBuffer, meta.DeviceID, appDeviceID, temp)
 		if err != nil {
+			mc.close()
 			return WmpfSession{}, err
 		}
 		if err = mc.sendApp(cmdManualAuth, body); err != nil {
+			mc.close()
 			last = err
 			continue
 		}
 		resp, err := mc.recvApp()
 		if err != nil {
+			mc.close()
 			last = err
 			continue
 		}
 		if resp.Cmd != cmdManualAuth {
+			mc.close()
 			last = fmt.Errorf("manualauth failed: cmd=%d", resp.Cmd)
 			continue
 		}
 		mar, err := parseLoginResponse(resp.Body, temp)
 		if err != nil {
+			mc.close()
 			last = err
 			continue
 		}
 		appSess, err := extractSession(mar)
 		if err != nil {
+			mc.close()
+			// 上游已明确返回 ManualAuthResponse 业务拒绝/无会话块，无需继续轮询全部 6 个 LongLink IP
+			if strings.Contains(err.Error(), "ManualAuthResponse") {
+				return WmpfSession{}, err
+			}
 			last = err
 			continue
 		}
 		appSess.DeviceID = meta.DeviceID
 		appSess.HostAppID = meta.HostAppID
 		psks, err := mc.extractPSKs()
+		mc.close()
 		if err != nil {
 			last = err
 			continue
