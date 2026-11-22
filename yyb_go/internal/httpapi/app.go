@@ -81,7 +81,7 @@ func NewApp(cfg Config) (*App, error) {
 		cfg.AvatarTimeout = 10 * time.Second
 	}
 	if cfg.SessionTTL == 0 {
-		cfg.SessionTTL = 30 * time.Minute
+		cfg.SessionTTL = 6 * time.Hour
 	}
 	if cfg.QRSessionTTL == 0 {
 		cfg.QRSessionTTL = 5 * time.Minute
@@ -699,8 +699,7 @@ func (a *App) handleGetH5Code(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := a.pool.GetH5Code(r.Context(), acc.LoginBuffer, appID, redirectURI, scope, state, acc.ID, a.cfg.TCPProxy)
 	if err != nil {
-		errStr := strings.ToLower(err.Error())
-		if strings.Contains(errStr, "manualauth failed") || strings.Contains(errStr, "login_buffer is empty") || strings.Contains(errStr, "login_buffer expired") {
+		if isLoginBufferExpiredErr(err) {
 			_ = a.db.SetAccountStatus(r.Context(), acc.ID, "expired")
 			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
 			return
@@ -904,9 +903,8 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
 		return "alive"
 	}
-	// 只有当明确是 manualauth 失败时，才标记为 expired
-	errStr := strings.ToLower(err.Error())
-	if strings.Contains(errStr, "manualauth failed") || strings.Contains(errStr, "login_buffer is empty") {
+	// 只有当明确是 manualauth 认证失败/凭据被微信拒绝时，才标记为 expired
+	if isLoginBufferExpiredErr(err) {
 		log.Printf("[refreshLiveness] 账号 %d (%s) 微信认证已失效: %v", acc.ID, acc.OpenID, err)
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
 		return "expired"
@@ -935,6 +933,19 @@ type accountExpiredError struct{ openid string }
 
 func (e accountExpiredError) Error() string { return "account expired: " + e.openid }
 
+func isLoginBufferExpiredErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "manualauth failed") ||
+		strings.Contains(errStr, "manualauthresponse missing") ||
+		strings.Contains(errStr, "manualauthresponse rejected") ||
+		strings.Contains(errStr, "manualauthresponse session fields incomplete") ||
+		strings.Contains(errStr, "login_buffer is empty") ||
+		strings.Contains(errStr, "login_buffer expired")
+}
+
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
 	proxy := a.cfg.TCPProxy
 
@@ -946,6 +957,12 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	// 空 code 或非小程序拦截属于上游业务拒绝，不能清理会话重复重放
 	if strings.Contains(err.Error(), "wx.login returned empty code") || strings.Contains(err.Error(), "non-miniprogram AppID") {
 		return nil, err
+	}
+	// loginAndSession 明确返回凭据失效，直接标记 expired，避免无意义二次重放
+	if isLoginBufferExpiredErr(err) {
+		log.Printf("[invokeWXApp] 账号 %d (%s) 微信凭据已失效: %v", acc.ID, acc.OpenID, err)
+		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
+		return nil, accountExpiredError{openid: acc.OpenID}
 	}
 
 	// 2. 调用失败，清理失效 session
@@ -961,8 +978,7 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 
 	// 4. 重试依然失败，判断是否为微信底层鉴权失败
 	log.Printf("[invokeWXApp] 账号 %d (%s) 重试依然失败: %v", acc.ID, acc.OpenID, err)
-	errStr := strings.ToLower(err.Error())
-	if strings.Contains(errStr, "manualauth failed") || strings.Contains(errStr, "login_buffer is empty") || strings.Contains(errStr, "login_buffer expired") {
+	if isLoginBufferExpiredErr(err) {
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
 		return nil, accountExpiredError{openid: acc.OpenID}
 	}
