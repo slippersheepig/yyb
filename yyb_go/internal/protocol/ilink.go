@@ -91,15 +91,27 @@ func parseLoginBuffer(loginBufferB64 string) (loginMeta, error) {
 	return meta, nil
 }
 
-func randomAppDeviceID() ([]byte, error) {
-	b := make([]byte, 32)
-	_, err := rand.Read(b)
-	return b, err
+func stableAppDeviceID(seed []byte) []byte {
+	in := make([]byte, 0, 16+len(seed))
+	in = append(in, "yyb-app-device:"...)
+	in = append(in, seed...)
+	sum := sha256.Sum256(in)
+	return sum[:]
 }
 
 func randomSessDevice() []byte {
 	mac := make([]byte, 6)
 	_, _ = rand.Read(mac)
+	mac[0] = (mac[0] | 0x02) & 0xfe
+	return []byte(fmt.Sprintf("%02X-%02X-%02X-%02X-%02X-%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]))
+}
+
+func stableSessDevice(uin int64) []byte {
+	if uin == 0 {
+		return randomSessDevice()
+	}
+	sum := sha256.Sum256([]byte("yyb-sess-mac:" + strconv.FormatInt(uin, 10)))
+	mac := sum[:6]
 	mac[0] = (mac[0] | 0x02) & 0xfe
 	return []byte(fmt.Sprintf("%02X-%02X-%02X-%02X-%02X-%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]))
 }
@@ -325,15 +337,37 @@ func hybridECDHDecrypt(response []byte, temp *manualAuthTemp) ([]byte, error) {
 	return lz4Decompress(comp)
 }
 
+func extractBaseRet(m map[int]any) (int32, bool) {
+	if raw, ok := m[1].([]byte); ok {
+		base := pbParse(raw)
+		if v, ok := base[1].(int64); ok {
+			return int32(v), true
+		}
+	}
+	if v, ok := m[1].(int64); ok {
+		return int32(v), true
+	}
+	return 0, false
+}
+
 func extractSession(mar []byte) (AppSession, error) {
 	F := pbParse(mar)
 	f3, ok := F[3].([]byte)
 	if !ok {
+		if ret, hasRet := extractBaseRet(F); hasRet && ret != 0 {
+			return AppSession{}, fmt.Errorf("ManualAuthResponse rejected (ret=%d): missing f3", ret)
+		}
 		return AppSession{}, fmt.Errorf("ManualAuthResponse missing f3")
 	}
 	body := pbParse(f3)
 	body2, ok := body[2].([]byte)
 	if !ok {
+		if ret, hasRet := extractBaseRet(body); hasRet && ret != 0 {
+			return AppSession{}, fmt.Errorf("ManualAuthResponse rejected (ret=%d): missing session block", ret)
+		}
+		if ret, hasRet := extractBaseRet(F); hasRet && ret != 0 {
+			return AppSession{}, fmt.Errorf("ManualAuthResponse rejected (ret=%d): missing session block", ret)
+		}
 		return AppSession{}, fmt.Errorf("ManualAuthResponse missing session block")
 	}
 	body3, ok := body[3].([]byte)
@@ -379,7 +413,7 @@ func buildJSAPIPlaintext(uin int64, appID string, transURL []byte, transCmdID ui
 		hostAppID = hostAppIDDefault
 	}
 	if len(sessDevice) == 0 {
-		sessDevice = randomSessDevice()
+		sessDevice = stableSessDevice(uin)
 	}
 	aid := []byte(appID)
 	uin32 := uint32(uin)
@@ -531,7 +565,7 @@ func parseRawResponse(codeOrJSON, resp []byte) map[string]any {
 }
 
 func buildPhoneRequest(uin int64, appID string) []byte {
-	sessDevice := randomSessDevice()
+	sessDevice := stableSessDevice(uin)
 	aid := []byte(appID)
 	body := make([]byte, 0, 140)
 	body = append(body, pbLen(1, sessionInfo(uint32(uin), unifiedPCWindows, sessDevice))...)
@@ -545,7 +579,7 @@ func buildPhoneRequest(uin int64, appID string) []byte {
 
 func buildOperateRequest(uin int64, appID string, payload map[string]any) ([]byte, error) {
 	payload = extractOperatePayload(payload)
-	sessDevice := randomSessDevice()
+	sessDevice := stableSessDevice(uin)
 	aid := []byte(appID)
 	f3, err := json.Marshal(payload)
 	if err != nil {
