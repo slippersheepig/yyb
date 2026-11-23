@@ -58,9 +58,10 @@ type loginMeta struct {
 }
 
 type manualAuthTemp struct {
-	Ephemeral *ecdh.PrivateKey
-	OKM       []byte
-	CompBody  []byte
+	Ephemeral     *ecdh.PrivateKey
+	OKM           []byte
+	CompBody      []byte
+	RequestCipher []byte
 }
 
 type AppSession struct {
@@ -184,6 +185,13 @@ func buildLoginBody(loginBufferB64 string, deviceID, appDeviceID []byte, temp *m
 }
 
 func hybridECDHEncrypt(plaintext, serverPub []byte, temp *manualAuthTemp) ([]byte, error) {
+	return hybridECDHEncryptWithKey(plaintext, serverPub, nil, temp)
+}
+
+func hybridECDHEncryptWithKey(plaintext, serverPub, encKey []byte, temp *manualAuthTemp) ([]byte, error) {
+	if len(encKey) != 0 && len(encKey) != 24 {
+		return nil, fmt.Errorf("invalid hybrid session key length: %d", len(encKey))
+	}
 	eph, ephPub, err := generateECDH()
 	if err != nil {
 		return nil, err
@@ -206,9 +214,16 @@ func hybridECDHEncrypt(plaintext, serverPub []byte, temp *manualAuthTemp) ([]byt
 	if err != nil {
 		return nil, err
 	}
+	var encSession []byte
+	if len(encKey) > 0 {
+		encSession, err = aesGCMEncryptLayout(encKey, hash1[:], cek)
+		if err != nil {
+			return nil, err
+		}
+	}
 	prk := hkdfExtract(ilinkHKDFSalt, cek)
 	okm := hkdfExpand(prk, hash1[:], 56)
-	hash2 := sha256.Sum256(bytes.Join([][]byte{[]byte("1"), []byte("415"), ephPub, encCEK}, nil))
+	hash2 := sha256.Sum256(bytes.Join([][]byte{[]byte("1"), []byte("415"), ephPub, encCEK, encSession}, nil))
 	comp := lz4AllLiteral(plaintext)
 	encBody, err := aesGCMEncryptLayout(okm[:24], hash2[:], comp)
 	if err != nil {
@@ -219,12 +234,13 @@ func hybridECDHEncrypt(plaintext, serverPub []byte, temp *manualAuthTemp) ([]byt
 		temp.Ephemeral = eph
 		temp.OKM = okm
 		temp.CompBody = comp
+		temp.RequestCipher = encBody
 	}
-	out := make([]byte, 0, len(ecdhKey)+len(encCEK)+len(encBody)+16)
+	out := make([]byte, 0, len(ecdhKey)+len(encCEK)+len(encSession)+len(encBody)+16)
 	out = append(out, pbVar(1, 1)...)
 	out = append(out, pbLen(2, ecdhKey)...)
 	out = append(out, pbLen(3, encCEK)...)
-	out = append(out, pbLen(4, nil)...)
+	out = append(out, pbLen(4, encSession)...)
 	out = append(out, pbLen(5, encBody)...)
 	return out, nil
 }
