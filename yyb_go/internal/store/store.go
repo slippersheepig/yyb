@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -668,7 +669,9 @@ func scanSession(row accountScanner) (*SessionRow, error) {
 	if uin.Valid {
 		s.UIN = &uin.Int64
 	}
-	if err := json.Unmarshal([]byte(blob), &s.SessionBlob); err != nil {
+	dec := json.NewDecoder(strings.NewReader(blob))
+	dec.UseNumber()
+	if err := dec.Decode(&s.SessionBlob); err != nil {
 		return nil, fmt.Errorf("decode session_blob: %w", err)
 	}
 	return &s, nil
