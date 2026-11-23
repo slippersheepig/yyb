@@ -25,6 +25,18 @@ func getEnvDefault(key, def string) string {
 	return def
 }
 
+func getEnvDurationDefault(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	log.Printf("[main] invalid %s=%q, using default %s", key, v, def)
+	return def
+}
+
 func parseAllowedIPs(s string) []string {
 	if s == "" {
 		return nil
@@ -73,7 +85,7 @@ func main() {
 		ResourceRoot:   *resourceRoot,
 		DBFilename:     *dbFilename,
 		TCPProxy:       *tcpProxy,
-		SessionTTL:     6 * time.Hour,
+		SessionTTL:     getEnvDurationDefault("YYB_SESSION_TTL", 7*24*time.Hour),
 		RequestTimeout: 8 * time.Second,
 		AvatarTimeout:  10 * time.Second,
 		ScanTimeout:    180 * time.Second,
