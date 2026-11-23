@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
 
 	"yyb_go/internal/store"
 )
+
+const pskRenewMarginSeconds int64 = 60
 
 type Config struct {
 	ShortlinkTimeout        time.Duration
@@ -29,7 +32,7 @@ func DefaultConfig() Config {
 	return Config{
 		ShortlinkTimeout:        8 * time.Second,
 		LoginTimeout:            30 * time.Second,
-		SessionTTL:              6 * time.Hour,
+		SessionTTL:              7 * 24 * time.Hour,
 		DNSCacheTTL:             30 * time.Minute,
 		MaxShortlinkConcurrency: 1000,
 		MaxLoginConcurrency:     32,
@@ -112,40 +115,34 @@ func (p *Pool) GetH5Code(ctx context.Context, loginBuffer, appID, redirectURI, s
 	if err != nil {
 		return nil, err
 	}
-	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
-	st, err := p.state(ctx, loginBuffer, accountID, effective)
-	if err != nil && effective != "" && p.cfg.TCPProxyFallbackDirect {
-		st, err = p.state(ctx, loginBuffer, accountID, "")
-	}
-	if err != nil {
-		return nil, err
-	}
-	hostAppID := st.Session.HostAppID
-	if len(hostAppID) == 0 {
-		hostAppID = hostAppIDDefault
-	}
-	reqBytes := buildH5OAuthRequest(fullURL)
-	plain := buildJSAPIPlaintext(st.Session.UIN, appID, h5OAuthURL, h5OAuthCmdID, reqBytes, hostAppID, nil)
-	envelope, err := buildTransferPacket(st.Session, plain)
-	if err != nil {
-		return nil, err
-	}
-	_, reply, err := p.sendEnvelope(ctx, st, envelope)
-	if err != nil {
-		return nil, err
-	}
-	code, err := parseH5OAuthResult(reply, callback, resolvedState, 0)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{
-		"code":         code,
-		"appid":        appID,
-		"scope":        resolvedScope,
-		"state":        resolvedState,
-		"redirect_uri": callback,
-		"mode":         "h5_oauth_auto",
-	}, nil
+	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
+		hostAppID := st.Session.HostAppID
+		if len(hostAppID) == 0 {
+			hostAppID = hostAppIDDefault
+		}
+		reqBytes := buildH5OAuthRequest(fullURL)
+		plain := buildJSAPIPlaintext(st.Session.UIN, appID, h5OAuthURL, h5OAuthCmdID, reqBytes, hostAppID, nil)
+		envelope, err := buildTransferPacket(st.Session, plain)
+		if err != nil {
+			return nil, err
+		}
+		_, reply, err := p.sendEnvelope(ctx, st, envelope)
+		if err != nil {
+			return nil, err
+		}
+		code, err := parseH5OAuthResult(reply, callback, resolvedState, 0)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"code":         code,
+			"appid":        appID,
+			"scope":        resolvedScope,
+			"state":        resolvedState,
+			"redirect_uri": callback,
+			"mode":         "h5_oauth_auto",
+		}, nil
+	})
 }
 
 func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
@@ -191,17 +188,91 @@ func (p *Pool) CheckLiveness(ctx context.Context, loginBuffer string, accountID 
 	return err
 }
 
+// RefreshSessionPSK renews only the outer MMTLS 0-RTT PSK ticket via an anonymous
+// handshake while preserving the existing WeChat AppSession (SendKey/RecvKey/F9/UIN).
+func (p *Pool) RefreshSessionPSK(ctx context.Context, accountID int64, tcpProxy string) error {
+	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
+	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, effective))
+	lock.Lock()
+	defer lock.Unlock()
+	row, err := p.db.GetSessionAny(ctx, accountID, effective)
+	if err != nil {
+		return err
+	}
+	st, err := sessionFromBlob(row.SessionBlob)
+	if err != nil {
+		return err
+	}
+	_, err = p.refreshPSKLocked(ctx, st, accountID, effective)
+	return err
+}
+
+// KeepSessionFresh ensures an active account has a cached WmpfSession and proactively
+// renews the outer MMTLS PSK when it is within renewBefore of expiring, without
+// touching WeChat when the existing PSK still has plenty of lifetime left.
+func (p *Pool) KeepSessionFresh(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, renewBefore time.Duration) error {
+	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
+	row, err := p.db.GetSessionAny(ctx, accountID, effective)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if loginBuffer == "" {
+				return nil
+			}
+			_, stateErr := p.state(ctx, loginBuffer, accountID, effective)
+			return stateErr
+		}
+		return err
+	}
+	st, err := sessionFromBlob(row.SessionBlob)
+	if err != nil {
+		if loginBuffer == "" {
+			return err
+		}
+		_, stateErr := p.state(ctx, loginBuffer, accountID, effective)
+		return stateErr
+	}
+	now := time.Now().Unix()
+	margin := int64(renewBefore.Seconds())
+	if margin < pskRenewMarginSeconds {
+		margin = pskRenewMarginSeconds
+	}
+	if st.PSK.PreSharedKey != "" && st.PSK.TicketEntry != "" && st.PSK.ExpiredAt > now+margin && row.ExpiresAt > now+margin {
+		return nil
+	}
+	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, effective))
+	lock.Lock()
+	defer lock.Unlock()
+	row, err = p.db.GetSessionAny(ctx, accountID, effective)
+	if err != nil {
+		return err
+	}
+	st, err = sessionFromBlob(row.SessionBlob)
+	if err != nil {
+		return err
+	}
+	now = time.Now().Unix()
+	if st.PSK.PreSharedKey != "" && st.PSK.TicketEntry != "" && st.PSK.ExpiredAt > now+margin {
+		// PSK itself is still fresh; just extend the local DB expires_at if it was capped earlier.
+		uin := st.Session.UIN
+		return p.db.PutSession(ctx, accountID, &uin, st.toBlob(), sessionExpiresAt(st, p.cfg.SessionTTL), effective)
+	}
+	_, err = p.refreshPSKLocked(ctx, st, accountID, effective)
+	return err
+}
+
 func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, op func(context.Context, WmpfSession) (map[string]any, error)) (map[string]any, error) {
 	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
 	st, err := p.state(ctx, loginBuffer, accountID, effective)
 	if err == nil {
-		res, err := op(ctx, st)
-		if err == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect || err.Error() == "wx.login returned empty code" {
-			return res, err
+		res, opErr := op(ctx, st)
+		var h5Rej *ErrH5OAuthBusinessRejected
+		if opErr == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect || opErr.Error() == "wx.login returned empty code" || errors.As(opErr, &h5Rej) {
+			return res, opErr
 		}
 		_ = p.Invalidate(ctx, accountID, effective)
+		err = opErr
 	}
-	if effective != "" && p.cfg.TCPProxyFallbackDirect {
+	if effective != "" && p.cfg.TCPProxyFallbackDirect && (err == nil || !strings.Contains(err.Error(), "ManualAuthResponse")) {
 		st, err = p.state(ctx, loginBuffer, accountID, "")
 		if err != nil {
 			return nil, err
@@ -211,17 +282,37 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	return nil, err
 }
 
+func isPSKUsable(psk pskEntry, now int64) bool {
+	return psk.PreSharedKey != "" && psk.TicketEntry != "" && psk.ExpiredAt > now+pskRenewMarginSeconds
+}
+
 func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string) (WmpfSession, error) {
-	if row, err := p.db.GetSession(ctx, accountID, tcpProxy); err == nil {
-		return sessionFromBlob(row.SessionBlob)
+	if row, err := p.db.GetSessionAny(ctx, accountID, tcpProxy); err == nil {
+		if st, parseErr := sessionFromBlob(row.SessionBlob); parseErr == nil {
+			now := time.Now().Unix()
+			if isPSKUsable(st.PSK, now) && row.ExpiresAt > now {
+				return st, nil
+			}
+		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return WmpfSession{}, err
 	}
 	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, tcpProxy))
 	lock.Lock()
 	defer lock.Unlock()
-	if row, err := p.db.GetSession(ctx, accountID, tcpProxy); err == nil {
-		return sessionFromBlob(row.SessionBlob)
+	if row, err := p.db.GetSessionAny(ctx, accountID, tcpProxy); err == nil {
+		if st, parseErr := sessionFromBlob(row.SessionBlob); parseErr == nil {
+			now := time.Now().Unix()
+			if isPSKUsable(st.PSK, now) {
+				// Preserve existing AppSession & PSK and heal any old short expires_at cap.
+				uin := st.Session.UIN
+				_ = p.db.PutSession(ctx, accountID, &uin, st.toBlob(), sessionExpiresAt(st, p.cfg.SessionTTL), tcpProxy)
+				return st, nil
+			}
+			// AppSession is still intact; refresh only the outer anonymous MMTLS PSK
+			// so we do not discard a live WeChat session or replay an old login_buffer.
+			return p.refreshPSKLocked(ctx, st, accountID, tcpProxy)
+		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return WmpfSession{}, err
 	}
@@ -246,7 +337,65 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	if err = p.db.PutSession(ctx, accountID, &uin, blob, expiresAt, tcpProxy); err != nil {
 		return WmpfSession{}, err
 	}
+	log.Printf("[pool] account %d ManualAuth succeeded (uin=%d, psk_lifetime=%ds, session_expires_at=%d)", accountID, uin, st.PSK.Lifetime, expiresAt)
 	return st, nil
+}
+
+func (p *Pool) refreshPSKLocked(ctx context.Context, st WmpfSession, accountID int64, tcpProxy string) (WmpfSession, error) {
+	if err := acquire(ctx, p.loginSem); err != nil {
+		return WmpfSession{}, err
+	}
+	defer release(p.loginSem)
+	loginCtx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
+	defer cancel()
+	psk, shortTargets, err := p.fetchFreshPSK(loginCtx, tcpProxy)
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	st.PSK = psk
+	st.ShortlinkTargets = shortTargets
+	st.CreatedAt = time.Now()
+	st.TCPProxy = tcpProxy
+	uin := st.Session.UIN
+	expiresAt := sessionExpiresAt(st, p.cfg.SessionTTL)
+	if err = p.db.PutSession(ctx, accountID, &uin, st.toBlob(), expiresAt, tcpProxy); err != nil {
+		return WmpfSession{}, err
+	}
+	log.Printf("[pool] account %d refreshed MMTLS PSK (preserving AppSession, lifetime=%ds)", accountID, psk.Lifetime)
+	return st, nil
+}
+
+func (p *Pool) fetchFreshPSK(ctx context.Context, tcpProxy string) (pskEntry, []Target, error) {
+	targets, err := getLonglinkTargets(ctx, p.cfg.LoginTimeout, p.cfg.DNSCacheTTL)
+	if err != nil {
+		return pskEntry{}, nil, fmt.Errorf("HTTPDNS LongLink failed: %w", err)
+	}
+	targets = orderLonglinkTargets(targets, 6)
+	var last error
+	for _, t := range targets {
+		mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
+		if err != nil {
+			last = err
+			continue
+		}
+		psks, err := mc.extractPSKs()
+		mc.close()
+		if err != nil {
+			last = err
+			continue
+		}
+		psk, ok := pickAccessPSK(psks)
+		if !ok {
+			last = fmt.Errorf("MMTLS handshake finished but no access PSK was issued")
+			continue
+		}
+		shortTargets := getShortlinkTargets(ctx, p.cfg.ShortlinkTimeout, p.cfg.DNSCacheTTL)
+		return psk, shortTargets, nil
+	}
+	if last == nil {
+		last = fmt.Errorf("no LongLink candidates")
+	}
+	return pskEntry{}, nil, fmt.Errorf("all LongLink candidates failed for PSK refresh: %w", last)
 }
 
 func (p *Pool) lockFor(key string) *sync.Mutex {
