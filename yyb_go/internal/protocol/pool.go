@@ -42,6 +42,7 @@ func DefaultConfig() Config {
 
 type WmpfSession struct {
 	Session          AppSession
+	AutoAuth         AutoAuthState
 	PSK              pskEntry
 	ShortlinkTargets []Target
 	CreatedAt        time.Time
@@ -266,7 +267,8 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	if err == nil {
 		res, opErr := op(ctx, st)
 		var h5Rej *ErrH5OAuthBusinessRejected
-		if opErr == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect || opErr.Error() == "wx.login returned empty code" || errors.As(opErr, &h5Rej) {
+		var slRej *ShortlinkRejectedError
+		if opErr == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect || opErr.Error() == "wx.login returned empty code" || errors.As(opErr, &h5Rej) || errors.As(opErr, &slRej) {
 			return res, opErr
 		}
 		_ = p.Invalidate(ctx, accountID, effective)
@@ -470,6 +472,7 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 		}
 		appSess.DeviceID = meta.DeviceID
 		appSess.HostAppID = meta.HostAppID
+		autoAuth := autoAuthFromManualAuth(mar, appDeviceID)
 		psks, err := mc.extractPSKs()
 		mc.close()
 		if err != nil {
@@ -484,6 +487,7 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 		shortTargets := getShortlinkTargets(ctx, p.cfg.ShortlinkTimeout, p.cfg.DNSCacheTTL)
 		return WmpfSession{
 			Session:          appSess,
+			AutoAuth:         autoAuth,
 			PSK:              psk,
 			ShortlinkTargets: shortTargets,
 			CreatedAt:        time.Now(),
@@ -544,7 +548,7 @@ func sessionExpiresAt(st WmpfSession, ttl time.Duration) int64 {
 }
 
 func (st WmpfSession) toBlob() map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"session": map[string]any{
 			"send_key":   encBytes(st.Session.SendKey),
 			"recv_key":   encBytes(st.Session.RecvKey),
@@ -558,6 +562,15 @@ func (st WmpfSession) toBlob() map[string]any {
 		"shortlink_targets": targetsToAny(st.ShortlinkTargets),
 		"tcp_proxy":         st.TCPProxy,
 	}
+	if len(st.AutoAuth.Key) > 0 || len(st.AutoAuth.EncKey) > 0 || st.AutoAuth.AttemptedAt > 0 {
+		out["auto_auth"] = map[string]any{
+			"device":       encBytes(st.AutoAuth.Device),
+			"key":          encBytes(st.AutoAuth.Key),
+			"enc_key":      encBytes(st.AutoAuth.EncKey),
+			"attempted_at": st.AutoAuth.AttemptedAt,
+		}
+	}
+	return out
 }
 
 func sessionFromBlob(blob map[string]any) (WmpfSession, error) {
@@ -589,6 +602,14 @@ func sessionFromBlob(blob map[string]any) (WmpfSession, error) {
 		ShortlinkTargets: targetsFromAny(blob["shortlink_targets"]),
 		TCPProxy:         stringAny(blob["tcp_proxy"]),
 		CreatedAt:        time.Now(),
+	}
+	if am, ok := blob["auto_auth"].(map[string]any); ok {
+		st.AutoAuth = AutoAuthState{
+			Device:      decBytes(am["device"]),
+			Key:         decBytes(am["key"]),
+			EncKey:      decBytes(am["enc_key"]),
+			AttemptedAt: int64FromAny(am["attempted_at"]),
+		}
 	}
 	if len(st.ShortlinkTargets) == 0 {
 		st.ShortlinkTargets = []Target{{IP: "120.241.131.173", Port: 80}}
