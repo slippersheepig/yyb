@@ -6,10 +6,14 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,30 +21,79 @@ const (
 	yybHost         = "https://yybadaccess.3g.qq.com"
 	loginBufferURL  = yybHost + "/pc_yyb_auth/pcyyb_get_wx_login_buffer_auth"
 	refreshTokenURL = yybHost + "/pc_yyb_auth/pcyyb_refresh_token_auth"
+	mainRefreshURL  = yybHost + "/pc_yyb/pcyyb_refresh_token"
+	checkLoginURL   = yybHost + "/pc_yyb/pcyyb_check_login"
 	userInfoURL     = yybHost + "/pc_yyb/pcyyb_get_user_info"
+	mainBusinessID  = "pc_yyb"
 	loginBusinessID = "pc_yyb_auth"
 	loginAccessKey  = "wgrdg373hy26ww2"
 )
 
+type RefreshRejectedError struct {
+	Code      int
+	Message   string
+	Operation string
+}
+
+func (e *RefreshRejectedError) Error() string {
+	op := e.Operation
+	if op == "" {
+		op = "refresh"
+	}
+	return fmt.Sprintf("%s failed: code=%d msg=%s", op, e.Code, e.Message)
+}
+
+type LoginBufferRejectedError struct {
+	Code    int
+	Message string
+}
+
+func (e *LoginBufferRejectedError) Error() string {
+	return fmt.Sprintf("login_buffer failed: code=%d msg=%s", e.Code, e.Message)
+}
+
+// IsHardCredentialRevoked reports whether an upstream refresh/check_login error
+// indicates explicit WeChat refresh_token revocation (42007 / 40030 / 42002 / 40188).
+func IsHardCredentialRevoked(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "42007") ||
+		strings.Contains(s, "40030") ||
+		strings.Contains(s, "42002") ||
+		strings.Contains(s, "40188") ||
+		strings.Contains(s, "invalid refresh_token")
+}
+
 type LoginBufferCredentials struct {
-	OpenID       string `json:"openid"`
-	AccessToken  string `json:"accesstoken"`
-	RefreshToken string `json:"refreshtoken"`
-	LoginType    string `json:"logintype"`
-	Nickname     string `json:"nickname"`
-	ExpiresAt    int64  `json:"expires_at"`
-	ExpiresIn    int64  `json:"expires_in"`
+	OpenID            string `json:"openid"`
+	AccessToken       string `json:"accesstoken"`
+	RefreshToken      string `json:"refreshtoken"`
+	RefreshBusinessID string `json:"refresh_business_id,omitempty"`
+	LoginType         string `json:"logintype"`
+	Nickname          string `json:"nickname"`
+	ExpiresAt         int64  `json:"expires_at"`
+	ExpiresIn         int64  `json:"expires_in"`
 }
 
 func CredentialsFromMap(m map[string]any) LoginBufferCredentials {
+	expiresIn := defaultInt64(int64FromMap(m, "expires_in"), 7200)
+	expiresAt := int64FromMap(m, "expires_at")
+	if expiresAt <= 0 {
+		if refreshedAt := int64FromMap(m, "refresh_refreshed_at"); refreshedAt > 0 {
+			expiresAt = refreshedAt + expiresIn
+		}
+	}
 	return LoginBufferCredentials{
-		OpenID:       stringFromMap(m, "openid"),
-		AccessToken:  stringFromMap(m, "accesstoken"),
-		RefreshToken: stringFromMap(m, "refreshtoken"),
-		LoginType:    defaultString(stringFromMap(m, "logintype"), "WX"),
-		Nickname:     stringFromMap(m, "nickname"),
-		ExpiresAt:    int64FromMap(m, "expires_at"),
-		ExpiresIn:    defaultInt64(int64FromMap(m, "expires_in"), 7200),
+		OpenID:            stringFromMap(m, "openid"),
+		AccessToken:       stringFromMap(m, "accesstoken"),
+		RefreshToken:      stringFromMap(m, "refreshtoken"),
+		RefreshBusinessID: stringFromMap(m, "refresh_business_id"),
+		LoginType:         defaultString(stringFromMap(m, "logintype"), "WX"),
+		Nickname:          stringFromMap(m, "nickname"),
+		ExpiresAt:         expiresAt,
+		ExpiresIn:         expiresIn,
 	}
 }
 
@@ -49,6 +102,7 @@ func (c LoginBufferCredentials) ToMap() map[string]any {
 		"openid":               c.OpenID,
 		"accesstoken":          c.AccessToken,
 		"refreshtoken":         c.RefreshToken,
+		"refresh_business_id":  c.RefreshBusinessID,
 		"logintype":            defaultString(c.LoginType, "WX"),
 		"nickname":             c.Nickname,
 		"expires_at":           c.ExpiresAt,
@@ -94,7 +148,7 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 		return "", err
 	}
 	ts, nonce := timestampMS(), nonce4()
-	var data map[string]any
+	var data loginCredentialResponse
 	if err = c.requestJSON(ctx, http.MethodPost, loginBufferURL, body, map[string]string{
 		"Content-Type":          "application/json",
 		"Ual-Access-Businessid": loginBusinessID,
@@ -105,10 +159,14 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 	}, &data); err != nil {
 		return "", err
 	}
-	if intFromAny(data["code"]) != 0 {
-		return "", fmt.Errorf("login_buffer failed: code=%v msg=%v", data["code"], data["msg"])
+	code, err := credentialResponseCode(data.Code)
+	if err != nil {
+		return "", err
 	}
-	values := stringSlicePath(data, "ext_info", "list_s", "login_buffer", "value")
+	if code != 0 {
+		return "", &LoginBufferRejectedError{Code: code, Message: redactCredMessage(fmt.Sprint(data.Message), creds)}
+	}
+	values := stringSlicePath(data.ExtInfo, "list_s", "login_buffer", "value")
 	if len(values) == 0 || values[0] == "" {
 		return "", fmt.Errorf("login_buffer response is empty")
 	}
@@ -116,6 +174,39 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 }
 
 func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginBufferCredentials) (LoginBufferCredentials, error) {
+	if creds.RefreshToken == "" {
+		return LoginBufferCredentials{}, fmt.Errorf("missing refresh token")
+	}
+	// QR login originates from /pc_yyb/pcyyb_oauth (business "pc_yyb").
+	// Set YYB_APPSTORE_REFRESH_MODE=legacy_auth to force the historical _auth route.
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("YYB_APPSTORE_REFRESH_MODE")))
+	business, endpoint, key := mainBusinessID, mainRefreshURL, ""
+	if mode == "legacy_auth" || creds.RefreshBusinessID == loginBusinessID {
+		business, endpoint, key = loginBusinessID, refreshTokenURL, loginAccessKey
+	}
+	refreshed, err := c.requestCredentials(ctx, creds, endpoint, business, key)
+	if err == nil {
+		return refreshed, nil
+	}
+	var rejected *RefreshRejectedError
+	if errors.As(err, &rejected) && rejected.Code == -109 && ctx.Err() == nil {
+		// -109 is a gateway wrapper (RC_PARAMS_INVALID), not proof of revocation.
+		// Query official /pc_yyb/pcyyb_check_login once to recover/rotate or reveal
+		// the underlying WeChat error code (e.g. 42007 / 40030).
+		checked, checkErr := c.CheckLogin(ctx, creds)
+		if checkErr == nil {
+			return checked, nil
+		}
+		return LoginBufferCredentials{}, fmt.Errorf("%w; %w", err, checkErr)
+	}
+	return LoginBufferCredentials{}, err
+}
+
+func (c *LoginBufferClient) CheckLogin(ctx context.Context, creds LoginBufferCredentials) (LoginBufferCredentials, error) {
+	return c.requestCredentials(ctx, creds, checkLoginURL, mainBusinessID, "")
+}
+
+func (c *LoginBufferClient) requestCredentials(ctx context.Context, creds LoginBufferCredentials, endpoint, business, key string) (LoginBufferCredentials, error) {
 	if creds.RefreshToken == "" {
 		return LoginBufferCredentials{}, fmt.Errorf("missing refresh token")
 	}
@@ -129,24 +220,43 @@ func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginB
 		return LoginBufferCredentials{}, err
 	}
 	ts, nonce := timestampMS(), nonce4()
-	var data map[string]any
-	if err = c.requestJSON(ctx, http.MethodPost, refreshTokenURL, body, map[string]string{
+	var data loginCredentialResponse
+	if err = c.requestJSON(ctx, http.MethodPost, endpoint, body, map[string]string{
 		"Content-Type":          "application/json",
-		"Ual-Access-Businessid": loginBusinessID,
+		"Ual-Access-Businessid": business,
 		"Ual-Access-Timestamp":  ts,
 		"Ual-Access-Nonce":      nonce,
-		"Ual-Access-Signature":  sign(string(body), nonce, ts, loginAccessKey),
+		"Ual-Access-Signature":  sign(string(body), nonce, ts, key),
 	}, &data); err != nil {
 		return LoginBufferCredentials{}, err
 	}
-	if intFromAny(data["code"]) != 0 {
-		return LoginBufferCredentials{}, fmt.Errorf("refresh failed: code=%v msg=%v", data["code"], data["msg"])
+	code, err := credentialResponseCode(data.Code)
+	if err != nil {
+		return LoginBufferCredentials{}, err
 	}
-	info, _ := data["user_info"].(map[string]any)
-	expiresIn := defaultInt64(int64FromMap(info, "expires_in"), 7200)
+	if code != 0 {
+		op := "refresh_token"
+		if endpoint == checkLoginURL {
+			op = "check_login"
+		}
+		return LoginBufferCredentials{}, &RefreshRejectedError{
+			Code:      code,
+			Message:   redactCredMessage(fmt.Sprint(data.Message), creds),
+			Operation: op,
+		}
+	}
+	info := data.UserInfo
+	if info == nil {
+		info = data.UserInfoCamel
+	}
+	if openID := firstStringMap(info, "open_id", "openId"); openID != "" && openID != creds.OpenID {
+		return LoginBufferCredentials{}, fmt.Errorf("credential response account mismatch")
+	}
+	expiresIn := defaultInt64(firstInt64Map(info, "expires_in", "expiresIn"), 7200)
 	refreshed := creds
-	refreshed.AccessToken = stringFromMap(info, "access_token")
-	if rt := stringFromMap(info, "refresh_token"); rt != "" {
+	refreshed.RefreshBusinessID = business
+	refreshed.AccessToken = firstStringMap(info, "access_token", "accessToken")
+	if rt := firstStringMap(info, "refresh_token", "refreshToken"); rt != "" {
 		refreshed.RefreshToken = rt
 	}
 	refreshed.ExpiresIn = expiresIn
@@ -164,7 +274,9 @@ func (c *LoginBufferClient) RefreshLoginBuffer(ctx context.Context, creds LoginB
 	}
 	lb, err := c.FetchLoginBuffer(ctx, refreshed)
 	if err != nil {
-		return LoginBufferResult{}, err
+		// Always return rotated credentials even if FetchLoginBuffer fails,
+		// so callers persist the new access/refresh tokens instead of losing them.
+		return LoginBufferResult{Credentials: refreshed, Refreshed: true}, err
 	}
 	return LoginBufferResult{LoginBuffer: lb, Credentials: refreshed, Refreshed: true}, nil
 }
@@ -249,6 +361,67 @@ type refreshTokenUserInfo struct {
 	RefreshToken string `json:"refreshToken"`
 	AccessToken  string `json:"accessToken"`
 	LoginType    string `json:"loginType"`
+}
+type loginCredentialResponse struct {
+	Code          json.RawMessage `json:"code"`
+	Message       any             `json:"msg"`
+	UserInfo      map[string]any  `json:"user_info"`
+	ExtInfo       map[string]any  `json:"ext_info"`
+	UserInfoCamel map[string]any  `json:"userInfo"`
+}
+
+func redactCredMessage(message string, creds LoginBufferCredentials) string {
+	for _, secret := range []string{creds.AccessToken, creds.RefreshToken, creds.OpenID} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	return message
+}
+
+func credentialResponseCode(raw json.RawMessage) (int, error) {
+	if len(raw) == 0 {
+		return 0, fmt.Errorf("credential response missing code")
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		var s string
+		if sErr := json.Unmarshal(raw, &s); sErr == nil {
+			n, pErr := strconv.ParseInt(strings.TrimSpace(s), 10, 32)
+			if pErr == nil {
+				return int(n), nil
+			}
+		}
+		return 0, fmt.Errorf("credential response code must be an integer")
+	}
+	n, err := strconv.ParseInt(number.String(), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("credential response code must be an integer")
+	}
+	return int(n), nil
+}
+
+func firstStringMap(m map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if s := stringFromMap(m, key); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func firstInt64Map(m map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		if n := int64FromMap(m, key); n != 0 {
+			return n
+		}
+		if s, ok := m[key].(string); ok {
+			if n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil && n != 0 {
+				return n
+			}
+		}
+	}
+	return 0
 }
 
 func timestampMS() string {
