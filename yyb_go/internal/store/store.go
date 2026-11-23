@@ -482,6 +482,16 @@ func (db *DB) GetSession(ctx context.Context, accountID int64, tcpProxy string) 
 	return scanSession(row)
 }
 
+// GetSessionAny returns the cached session row regardless of expires_at so the
+// protocol pool can renew only the outer MMTLS PSK while keeping a valid AppSession.
+func (db *DB) GetSessionAny(ctx context.Context, accountID int64, tcpProxy string) (*SessionRow, error) {
+	row := db.sql.QueryRowContext(ctx,
+		"SELECT id, wechat_account_id, uin, tcp_proxy, session_blob, expires_at, created_at, updated_at FROM sessions WHERE wechat_account_id=? AND tcp_proxy=?",
+		accountID, tcpProxy,
+	)
+	return scanSession(row)
+}
+
 func (db *DB) PutSession(ctx context.Context, accountID int64, uin *int64, sessionBlob map[string]any, expiresAt int64, tcpProxy string) error {
 	now := time.Now().Unix()
 	blob, err := json.Marshal(sessionBlob)
@@ -502,6 +512,11 @@ func (db *DB) PutSession(ctx context.Context, accountID int64, uin *int64, sessi
 
 func (db *DB) InvalidateSession(ctx context.Context, accountID int64, tcpProxy string) error {
 	_, err := db.sql.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=? AND tcp_proxy=?", accountID, tcpProxy)
+	return err
+}
+
+func (db *DB) InvalidateAllSessions(ctx context.Context, accountID int64) error {
+	_, err := db.sql.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=?", accountID)
 	return err
 }
 
