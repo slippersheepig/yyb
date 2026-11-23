@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -116,7 +117,12 @@ func (p *Pool) GetH5Code(ctx context.Context, loginBuffer, appID, redirectURI, s
 	if err != nil {
 		return nil, err
 	}
+	authURL := strings.TrimSuffix(fullURL, "#wechat_redirect")
+	h5Mode := strings.ToLower(strings.TrimSpace(os.Getenv("YYB_H5_MODE")))
 	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
+		if h5Mode == "a8key" {
+			return p.getH5CodeViaA8Key(ctx, st, appID, authURL, callback, resolvedScope, resolvedState)
+		}
 		hostAppID := st.Session.HostAppID
 		if len(hostAppID) == 0 {
 			hostAppID = hostAppIDDefault
@@ -133,6 +139,18 @@ func (p *Pool) GetH5Code(ctx context.Context, loginBuffer, appID, redirectURI, s
 		}
 		code, err := parseH5OAuthResult(reply, callback, resolvedState, 0)
 		if err != nil {
+			var h5Rej *ErrH5OAuthBusinessRejected
+			if h5Mode != "1254" && errors.As(err, &h5Rej) && h5Rej.Depth == 0 {
+				// Outer wxaruntime_transfer (0x0b41) refused to forward cmd 1254 before
+				// any OAuth confirmation occurred; fall back once to independent iLink
+				// GetA8Key (cmd 5112) on the same live session.
+				log.Printf("[pool] account %d H5 cmd=1254 rejected at outer_transfer (ret=%d), trying A8Key(5112) fallback", accountID, h5Rej.Ret)
+				a8Res, a8Err := p.getH5CodeViaA8Key(ctx, st, appID, authURL, callback, resolvedScope, resolvedState)
+				if a8Err == nil {
+					return a8Res, nil
+				}
+				return nil, fmt.Errorf("%w; a8key fallback: %w", err, a8Err)
+			}
 			return nil, err
 		}
 		return map[string]any{
@@ -267,8 +285,9 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	if err == nil {
 		res, opErr := op(ctx, st)
 		var h5Rej *ErrH5OAuthBusinessRejected
+		var a8Rej *ErrH5A8KeyBusinessRejected
 		var slRej *ShortlinkRejectedError
-		if opErr == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect || opErr.Error() == "wx.login returned empty code" || errors.As(opErr, &h5Rej) || errors.As(opErr, &slRej) {
+		if opErr == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect || opErr.Error() == "wx.login returned empty code" || errors.As(opErr, &h5Rej) || errors.As(opErr, &a8Rej) || errors.As(opErr, &slRej) {
 			return res, opErr
 		}
 		_ = p.Invalidate(ctx, accountID, effective)
@@ -368,14 +387,21 @@ func (p *Pool) refreshPSKLocked(ctx context.Context, st WmpfSession, accountID i
 }
 
 func (p *Pool) fetchFreshPSK(ctx context.Context, tcpProxy string) (pskEntry, []Target, error) {
-	targets, err := getLonglinkTargets(ctx, p.cfg.LoginTimeout, p.cfg.DNSCacheTTL)
+	nodeTimeout := min(8*time.Second, p.cfg.LoginTimeout)
+	targets, err := getLonglinkTargets(ctx, nodeTimeout, p.cfg.DNSCacheTTL)
 	if err != nil {
 		return pskEntry{}, nil, fmt.Errorf("HTTPDNS LongLink failed: %w", err)
 	}
 	targets = orderLonglinkTargets(targets, 6)
 	var last error
 	for _, t := range targets {
-		mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
+		if ctx.Err() != nil {
+			if last == nil {
+				last = ctx.Err()
+			}
+			break
+		}
+		mc, err := connectMmtls(ctx, t, nodeTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
 		if err != nil {
 			last = err
 			continue
@@ -415,7 +441,8 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	if loginBuffer == "" {
 		return WmpfSession{}, fmt.Errorf("login_buffer is empty")
 	}
-	targets, err := getLonglinkTargets(ctx, p.cfg.LoginTimeout, p.cfg.DNSCacheTTL)
+	nodeTimeout := min(8*time.Second, p.cfg.LoginTimeout)
+	targets, err := getLonglinkTargets(ctx, nodeTimeout, p.cfg.DNSCacheTTL)
 	if err != nil {
 		return WmpfSession{}, fmt.Errorf("HTTPDNS LongLink failed: %w", err)
 	}
@@ -427,7 +454,13 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	appDeviceID := stableAppDeviceID(meta.DeviceID)
 	var last error
 	for _, t := range targets {
-		mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
+		if ctx.Err() != nil {
+			if last == nil {
+				last = ctx.Err()
+			}
+			break
+		}
+		mc, err := connectMmtls(ctx, t, nodeTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
 		if err != nil {
 			last = err
 			continue
