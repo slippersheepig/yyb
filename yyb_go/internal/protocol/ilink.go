@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -284,11 +285,12 @@ func decodeWpkgHead(data []byte) (map[int]uint64, map[int][]byte, int, error) {
 			return nil, nil, 0, err
 		}
 		i = ni
-		if i+int(ln) > len(data) {
+		if ln > uint64(len(data)-i) {
 			return nil, nil, 0, fmt.Errorf("wpkg bytes field truncated")
 		}
-		byts[int(fn)] = append([]byte(nil), data[i:i+int(ln)]...)
-		i += int(ln)
+		n := int(ln)
+		byts[int(fn)] = append([]byte(nil), data[i:i+n]...)
+		i += n
 	}
 	_, ni, err := readVarint(data, i)
 	if err != nil {
@@ -314,7 +316,7 @@ func parseLoginResponse(respBody []byte, temp *manualAuthTemp) ([]byte, error) {
 }
 
 func hybridECDHDecrypt(response []byte, temp *manualAuthTemp) ([]byte, error) {
-	if temp == nil || temp.Ephemeral == nil {
+	if temp == nil || temp.Ephemeral == nil || len(temp.OKM) < 56 {
 		return nil, fmt.Errorf("missing manualauth temp state")
 	}
 	F := pbParse(response)
@@ -629,13 +631,22 @@ func extractOperatePayload(raw map[string]any) map[string]any {
 }
 
 // ErrH5OAuthBusinessRejected reports an explicit non-zero business status from
-// the oauth_authorize CGI (command 1254).
+// the oauth_authorize CGI (command 1254) or its outer wxaruntime_transfer wrapper.
 type ErrH5OAuthBusinessRejected struct {
-	Ret int32
+	Ret    int32
+	Depth  int
+	ErrMsg string
 }
 
 func (e *ErrH5OAuthBusinessRejected) Error() string {
-	return fmt.Sprintf("h5 oauth rejected: business code=%d", e.Ret)
+	layer := "outer_transfer"
+	if e.Depth > 0 {
+		layer = fmt.Sprintf("inner_cgi_d%d", e.Depth)
+	}
+	if e.ErrMsg != "" {
+		return fmt.Sprintf("h5 oauth rejected: business code=%d (layer=%s, errmsg=%s)", e.Ret, layer, e.ErrMsg)
+	}
+	return fmt.Sprintf("h5 oauth rejected: business code=%d (layer=%s)", e.Ret, layer)
 }
 
 func buildH5OAuthAuthorizeURL(appID, redirectURI, scope, state string) (string, string, string, string, error) {
@@ -751,17 +762,17 @@ func parseH5OAuthResult(raw []byte, callback, state string, depth int) (string, 
 		location = string(field.b)
 	}
 	if strings.HasPrefix(location, "https://") || strings.HasPrefix(location, "http://") {
-		ret, retErr := h5OAuthBusinessStatus(fields)
+		ret, errMsg, retErr := h5OAuthBusinessStatus(fields)
 		if retErr != nil {
 			return "", retErr
 		}
 		if ret != 0 {
-			return "", &ErrH5OAuthBusinessRejected{Ret: ret}
+			return "", &ErrH5OAuthBusinessRejected{Ret: ret, Depth: depth, ErrMsg: errMsg}
 		}
 		return h5OAuthCallbackCode(location, callback, state)
 	}
-	if ret, retErr := h5OAuthBusinessStatus(fields); retErr == nil && ret != 0 {
-		return "", &ErrH5OAuthBusinessRejected{Ret: ret}
+	if ret, errMsg, retErr := h5OAuthBusinessStatus(fields); retErr == nil && ret != 0 {
+		return "", &ErrH5OAuthBusinessRejected{Ret: ret, Depth: depth, ErrMsg: errMsg}
 	}
 	for number := 1; number <= 32; number++ {
 		field, exists := fields[number]
@@ -780,20 +791,53 @@ func parseH5OAuthResult(raw []byte, callback, state string, depth int) (string, 
 	return "", errors.New("h5 oauth: callback payload absent")
 }
 
-func h5OAuthBusinessStatus(fields map[int]h5OAuthField) (int32, error) {
+func h5OAuthBusinessStatus(fields map[int]h5OAuthField) (int32, string, error) {
 	base, ok := fields[1]
 	if !ok || base.wire != 2 {
-		return 0, errors.New("h5 oauth: missing explicit business status")
+		return 0, "", errors.New("h5 oauth: missing explicit business status")
 	}
 	baseFields, err := parseH5OAuthFields(base.b)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	ret, ok := baseFields[1]
 	if !ok || ret.wire != 0 {
-		return 0, errors.New("h5 oauth: missing explicit business status")
+		return 0, "", errors.New("h5 oauth: missing explicit business status")
 	}
-	return int32(ret.n), nil
+	return int32(ret.n), extractBaseErrMsg(baseFields), nil
+}
+
+func extractBaseErrMsg(baseFields map[int]h5OAuthField) string {
+	f2, ok := baseFields[2]
+	if !ok || f2.wire != 2 || len(f2.b) == 0 {
+		return ""
+	}
+	raw := f2.b
+	// WeChat BaseResponse.ErrMsg is usually SKBuiltinString_t { 1: string }.
+	if sub, err := parseH5OAuthFields(raw); err == nil {
+		if s, ok := sub[1]; ok && s.wire == 2 && len(s.b) > 0 {
+			raw = s.b
+		}
+	}
+	if !utf8.Valid(raw) {
+		return ""
+	}
+	msg := strings.TrimSpace(string(raw))
+	if msg == "" || strings.Contains(msg, "http://") || strings.Contains(msg, "https://") {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range msg {
+		if r < 32 && r != ' ' {
+			b.WriteByte(' ')
+		} else {
+			b.WriteRune(r)
+		}
+		if b.Len() >= 120 {
+			break
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func h5OAuthCallbackCode(location, callback, state string) (string, error) {
