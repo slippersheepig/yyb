@@ -25,26 +25,28 @@ import (
 )
 
 type Config struct {
-	ResourceRoot   string
-	DBFilename     string
-	TCPProxy       string
-	SessionTTL     time.Duration
-	RequestTimeout time.Duration
-	AvatarTimeout  time.Duration
-	ScanTimeout    time.Duration
-	QRSessionTTL   time.Duration
-	APIToken       string
-	AllowedIPs     []string
-	TGBotToken     string
-	TGAdminIDs     []int64
-	WebUser        string
-	WebPass        string
-	WxGzhLink      string
-	WxGzhName      string
-	AutopostURL    string // autopost service URL for JD verification
-	AutopostToken  string // Bearer token for autopost service auth
-	WebDomain      string // this server's external URL (e.g. https://yyb.example.com)
-	ListenPort     int    // this server's listen port (for fallback WebDomain)
+	ResourceRoot      string
+	DBFilename        string
+	TCPProxy          string
+	SessionTTL        time.Duration
+	KeepAliveInterval time.Duration
+	KeepAliveAhead    time.Duration
+	RequestTimeout    time.Duration
+	AvatarTimeout     time.Duration
+	ScanTimeout       time.Duration
+	QRSessionTTL      time.Duration
+	APIToken          string
+	AllowedIPs        []string
+	TGBotToken        string
+	TGAdminIDs        []int64
+	WebUser           string
+	WebPass           string
+	WxGzhLink         string
+	WxGzhName         string
+	AutopostURL       string // autopost service URL for JD verification
+	AutopostToken     string // Bearer token for autopost service auth
+	WebDomain         string // this server's external URL (e.g. https://yyb.example.com)
+	ListenPort        int    // this server's listen port (for fallback WebDomain)
 }
 
 type App struct {
@@ -56,8 +58,9 @@ type App struct {
 	tgBot     *tgbot.Bot
 	webAuth   *WebSessionManager
 
-	mu         sync.Mutex
-	qrSessions map[string]*qr.Session
+	mu           sync.Mutex
+	qrSessions   map[string]*qr.Session
+	ualFailUntil map[int64]time.Time
 }
 
 var swaggerDocsHandler = httpSwagger.Handler(
@@ -83,6 +86,12 @@ func NewApp(cfg Config) (*App, error) {
 	if cfg.SessionTTL == 0 {
 		cfg.SessionTTL = 7 * 24 * time.Hour
 	}
+	if cfg.KeepAliveInterval == 0 {
+		cfg.KeepAliveInterval = 2 * time.Minute
+	}
+	if cfg.KeepAliveAhead == 0 {
+		cfg.KeepAliveAhead = 5 * time.Minute
+	}
 	if cfg.QRSessionTTL == 0 {
 		cfg.QRSessionTTL = 5 * time.Minute
 	}
@@ -105,30 +114,42 @@ func NewApp(cfg Config) (*App, error) {
 	pool := protocol.NewPool(poolCfg, db)
 	webAuth := NewWebSessionManager(cfg.WebUser, cfg.WebPass)
 	return &App{
-		cfg:        cfg,
-		resources:  res,
-		db:         db,
-		pool:       pool,
-		qr:         qr.NewClient(cfg.RequestTimeout),
-		qrSessions: map[string]*qr.Session{},
-		webAuth:    webAuth,
+		cfg:          cfg,
+		resources:    res,
+		db:           db,
+		pool:         pool,
+		qr:           qr.NewClient(cfg.RequestTimeout),
+		qrSessions:   map[string]*qr.Session{},
+		ualFailUntil: map[int64]time.Time{},
+		webAuth:      webAuth,
 	}, nil
 }
 
-// StartAutoRefresh launches a background goroutine that periodically refreshes
-// all alive accounts' credentials before they expire.
-//
-// Strategy:
-//   - Check every 30 minutes (low frequency)
-//   - Only refresh accounts whose access token expires within 30 minutes
-//   - On refresh failure, retry up to 2 times with 10s delay
-//   - If all retries fail, mark account as "expired" (no notification)
-//   - No Telegram notifications; if it expires, it expires
+// StartAutoRefresh launches a background goroutine aligned with official PC YYB
+// (AndrowsSvr.exe):
+//   - Lightweight DB scan every KeepAliveInterval (default 2m; no network traffic
+//     unless an account is actually within its renewal window).
+//   - Token-only refresh via /pc_yyb/pcyyb_refresh_token (and /pc_yyb/pcyyb_check_login
+//     on -109) when access_token expires within KeepAliveAhead (default 5m), persisting
+//     rotated tokens immediately without prematurely minting login_buffer.
+//   - Proactive anonymous MMTLS PSK renewal for active WMPF sessions.
 func (a *App) StartAutoRefresh(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Minute)
+	if a.cfg.KeepAliveInterval < 0 {
+		log.Printf("[autoRefresh] disabled by configuration")
+		return
+	}
+	interval := a.cfg.KeepAliveInterval
+	if interval == 0 {
+		interval = 2 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	// Run once on startup after a short delay to let the server bind first.
-	time.Sleep(10 * time.Second)
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(10 * time.Second):
+	}
 	a.autoRefreshAll(ctx)
 	for {
 		select {
@@ -140,6 +161,25 @@ func (a *App) StartAutoRefresh(ctx context.Context) {
 	}
 }
 
+func (a *App) isUALBackedOff(accountID int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	until, ok := a.ualFailUntil[accountID]
+	return ok && time.Now().Before(until)
+}
+
+func (a *App) setUALBackoff(accountID int64, d time.Duration) {
+	a.mu.Lock()
+	a.ualFailUntil[accountID] = time.Now().Add(d)
+	a.mu.Unlock()
+}
+
+func (a *App) clearUALBackoff(accountID int64) {
+	a.mu.Lock()
+	delete(a.ualFailUntil, accountID)
+	a.mu.Unlock()
+}
+
 func (a *App) autoRefreshAll(ctx context.Context) {
 	accounts, err := a.db.ListAccounts(ctx)
 	if err != nil {
@@ -147,21 +187,24 @@ func (a *App) autoRefreshAll(ctx context.Context) {
 		return
 	}
 	now := time.Now().Unix()
-	const refreshWindow = 60 * 60 // 60 minutes before expiry
+	aheadSec := int64(a.cfg.KeepAliveAhead.Seconds())
+	if aheadSec <= 0 {
+		aheadSec = 5 * 60
+	}
 	for _, acc := range accounts {
 		if acc.Status != nil && *acc.Status == "expired" {
 			continue
 		}
-		// 1. 若存在 UAL refresh_token 且 access_token 临近过期，尝试刷新 login_buffer
-		if acc.Credentials != nil {
+		// 1. 仅在 access_token 进入提前刷新窗口时执行纯 Token 续期并立即落库（不提前拉取 login_buffer）
+		if acc.Credentials != nil && !a.isUALBackedOff(acc.ID) {
 			creds := protocol.CredentialsFromMap(acc.Credentials)
-			if creds.RefreshToken != "" && creds.ExpiresAt <= now+refreshWindow {
+			if creds.RefreshToken != "" && creds.ExpiresAt <= now+aheadSec {
 				a.refreshOneAccount(ctx, acc)
 			}
 		}
 		// 2. 维护底层 WMPF 会话：确保会话已预热落库，并在外层 MMTLS PSK 临近过期时匿名续期 PSK（保留 AppSession）
 		keepCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-		if err := a.pool.KeepSessionFresh(keepCtx, acc.LoginBuffer, acc.ID, a.cfg.TCPProxy, 60*time.Minute); err != nil {
+		if err := a.pool.KeepSessionFresh(keepCtx, acc.LoginBuffer, acc.ID, a.cfg.TCPProxy, 30*time.Minute); err != nil {
 			log.Printf("[autoRefresh] account %d (%s) WMPF session keep-fresh skipped: %v", acc.ID, acc.OpenID, err)
 		}
 		cancel()
@@ -178,17 +221,23 @@ func (a *App) refreshOneAccount(ctx context.Context, acc *store.WechatAccount) {
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	result, err := a.qr.RefreshLoginBuffer(refreshCtx, creds)
+	refreshed, err := a.qr.LoginBuffers().RefreshCredentials(refreshCtx, creds)
 	if err == nil {
-		acc.LoginBuffer = result.LoginBuffer
-		acc.Credentials = result.Credentials.ToMap()
-		_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, acc.Credentials)
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
-		log.Printf("[autoRefresh] account %d (%s) refreshed OK", acc.ID, acc.OpenID)
+		acc.Credentials = refreshed.ToMap()
+		_ = a.db.SetAccountCredential(context.WithoutCancel(ctx), acc.ID, acc.LoginBuffer, acc.Credentials)
+		_ = a.db.SetAccountStatus(context.WithoutCancel(ctx), acc.ID, "alive")
+		a.clearUALBackoff(acc.ID)
+		log.Printf("[autoRefresh] account %d (%s) OAuth token refreshed OK (expires_in=%ds, business=%s)", acc.ID, acc.OpenID, refreshed.ExpiresIn, refreshed.RefreshBusinessID)
 		return
 	}
-	// 腾讯 UAL 刷新失败（PC扫码账号正常现象，返回 -109），绝不标记为 expired 误杀有效账号
-	log.Printf("[autoRefresh] account %d (%s) UAL refresh skipped: %v", acc.ID, acc.OpenID, err)
+	// 退避冷却避免每 2 分钟重复冲击腾讯 UAL；同时绝不清空可能仍可用的底层 WMPF AppSession/AutoAuth
+	if protocol.IsHardCredentialRevoked(err) {
+		a.setUALBackoff(acc.ID, 6*time.Hour)
+		log.Printf("[autoRefresh] account %d (%s) OAuth revoked upstream (preserving WMPF session): %v", acc.ID, acc.OpenID, err)
+		return
+	}
+	a.setUALBackoff(acc.ID, 30*time.Minute)
+	log.Printf("[autoRefresh] account %d (%s) UAL refresh failed (backoff 30m): %v", acc.ID, acc.OpenID, err)
 }
 
 func (a *App) Close() error {
@@ -880,7 +929,8 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 	if err != nil {
 		return nil, err
 	}
-	// 重新扫码成功，清理旧会话缓存与上一轮残留的京东二验风险链接
+	// 重新扫码成功，清理旧会话缓存、退避状态与上一轮残留的京东二验风险链接
+	a.clearUALBackoff(acc.ID)
 	_ = a.db.InvalidateAllSessions(ctx, acc.ID)
 	_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
 	// 趁刚拿到的 login_buffer 尚在有效期内，立即建立 WMPF 会话并落库，避免后续闲置导致 login_buffer 过期未消费
@@ -1016,13 +1066,14 @@ func isNonRetryableBizErr(err error) bool {
 
 // tryRefreshLoginBuffer attempts to obtain a fresh login_buffer from Tencent UAL
 // when ManualAuth rejects the stored one: first via an unexpired access_token,
-// then via refresh_token if available.
+// then via RefreshCredentials (/pc_yyb/pcyyb_refresh_token + check_login) + FetchLoginBuffer.
+// Rotated OAuth credentials are always persisted even if FetchLoginBuffer fails.
 func (a *App) tryRefreshLoginBuffer(ctx context.Context, acc *store.WechatAccount) (bool, string) {
 	if acc == nil || acc.Credentials == nil {
 		return false, "no stored UAL credentials"
 	}
 	creds := protocol.CredentialsFromMap(acc.Credentials)
-	refreshCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	refreshCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
 	var errs []string
@@ -1030,7 +1081,7 @@ func (a *App) tryRefreshLoginBuffer(ctx context.Context, acc *store.WechatAccoun
 		lb, err := a.qr.LoginBuffers().FetchLoginBuffer(refreshCtx, creds)
 		if err == nil && lb != "" && lb != acc.LoginBuffer {
 			acc.LoginBuffer = lb
-			_ = a.db.SetAccountCredential(ctx, acc.ID, lb, creds.ToMap())
+			_ = a.db.SetAccountCredential(context.WithoutCancel(ctx), acc.ID, lb, creds.ToMap())
 			log.Printf("[loginBufferRefresh] account %d (%s) fetched fresh login_buffer via active access_token", acc.ID, acc.OpenID)
 			return true, ""
 		}
@@ -1040,10 +1091,17 @@ func (a *App) tryRefreshLoginBuffer(ctx context.Context, acc *store.WechatAccoun
 	}
 	if creds.RefreshToken != "" {
 		res, err := a.qr.RefreshLoginBuffer(refreshCtx, creds)
-		if err == nil && res.LoginBuffer != "" {
-			acc.LoginBuffer = res.LoginBuffer
+		if res.Refreshed && res.Credentials.AccessToken != "" {
 			acc.Credentials = res.Credentials.ToMap()
-			_ = a.db.SetAccountCredential(ctx, acc.ID, res.LoginBuffer, acc.Credentials)
+			lb := acc.LoginBuffer
+			if res.LoginBuffer != "" {
+				lb = res.LoginBuffer
+				acc.LoginBuffer = lb
+			}
+			_ = a.db.SetAccountCredential(context.WithoutCancel(ctx), acc.ID, lb, acc.Credentials)
+			a.clearUALBackoff(acc.ID)
+		}
+		if err == nil && res.LoginBuffer != "" {
 			log.Printf("[loginBufferRefresh] account %d (%s) refreshed login_buffer via UAL refresh_token", acc.ID, acc.OpenID)
 			return true, ""
 		}
@@ -1056,7 +1114,7 @@ func (a *App) tryRefreshLoginBuffer(ctx context.Context, acc *store.WechatAccoun
 	return false, strings.Join(errs, "; ")
 }
 
-func (a *App) retryWithFreshLoginBuffer(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall, origErr error) (map[string]any, error) {
+func (a *App) retryWithFreshLoginBuffer(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall, origErr error, priorDiag ...string) (map[string]any, error) {
 	refreshed, refreshReason := a.tryRefreshLoginBuffer(ctx, acc)
 	if refreshed {
 		_ = a.db.InvalidateAllSessions(ctx, acc.ID)
@@ -1071,10 +1129,19 @@ func (a *App) retryWithFreshLoginBuffer(ctx context.Context, acc *store.WechatAc
 		origErr = retryErr
 		refreshReason = "refreshed login_buffer still rejected"
 	}
-	detail := origErr.Error()
-	if refreshReason != "" {
-		detail += "; " + refreshReason
+	var parts []string
+	for _, d := range priorDiag {
+		if d != "" {
+			parts = append(parts, d)
+		}
 	}
+	if origErr != nil {
+		parts = append(parts, origErr.Error())
+	}
+	if refreshReason != "" {
+		parts = append(parts, refreshReason)
+	}
+	detail := strings.Join(parts, "; ")
 	log.Printf("[invokeWXApp] 账号 %d (%s) 微信凭据已失效: %s", acc.ID, acc.OpenID, detail)
 	_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
 	return nil, accountExpiredError{openid: acc.OpenID, detail: detail}
@@ -1098,9 +1165,12 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 		return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err)
 	}
 
-	// 2. 若属于传输/0-RTT 层异常（非明确业务码拒绝），先尝试仅匿名刷新外层 MMTLS PSK，尽量保留 AppSession
+	firstDiag := err.Error()
+
+	// 2. 若属于外层传输/PSK 异常（非明确业务码或 ShortLink 应用层拒绝），先尝试仅匿名刷新外层 MMTLS PSK
 	var h5Rej *protocol.ErrH5OAuthBusinessRejected
-	if !errors.As(err, &h5Rej) {
+	var slRej *protocol.ShortlinkRejectedError
+	if !errors.As(err, &h5Rej) && !errors.As(err, &slRej) {
 		if pskErr := a.pool.RefreshSessionPSK(ctx, acc.ID, proxy); pskErr == nil {
 			log.Printf("[invokeWXApp] 账号 %d (%s) 调用失败(%v)，已匿名续期 MMTLS PSK 并重试", acc.ID, acc.OpenID, err)
 			result, err = call(ctx, acc, appID, payload)
@@ -1112,12 +1182,35 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 				return nil, err
 			}
 			if isLoginBufferExpiredErr(err) {
-				return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err)
+				return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err, firstDiag)
 			}
+			firstDiag = err.Error()
 		}
 	}
 
-	// 3. PSK 续期仍无法恢复（说明微信侧 AppSession 已失效），清理会话并使用 login_buffer 重建
+	// 3. 会话在微信侧失效（如 shortlink_application -14 或会话超时）：
+	//    在删除缓存会话前，优先尝试独立的微信原生 iLink AutoAuth (cmd 3198) 轮换密钥恢复（不依赖 OAuth/login_buffer）
+	var autoAuthDiag string
+	if autoErr := a.pool.TryNativeAutoAuth(ctx, acc.ID, proxy); autoErr == nil {
+		log.Printf("[invokeWXApp] 账号 %d (%s) 原生 AutoAuth(3198) 密钥轮换成功，重试业务调用", acc.ID, acc.OpenID)
+		result, err = call(ctx, acc, appID, payload)
+		if err == nil {
+			_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
+			return result, nil
+		}
+		if isNonRetryableBizErr(err) {
+			return nil, err
+		}
+		if isLoginBufferExpiredErr(err) {
+			return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err, firstDiag)
+		}
+		autoAuthDiag = "post_autoauth: " + err.Error()
+	} else {
+		autoAuthDiag = "autoauth: " + autoErr.Error()
+		log.Printf("[invokeWXApp] 账号 %d (%s) 原生 AutoAuth 未恢复(%v)，回退 login_buffer 重建", acc.ID, acc.OpenID, autoErr)
+	}
+
+	// 4. 清理失效会话，使用 login_buffer 重建 WMPF 会话
 	log.Printf("[invokeWXApp] 账号 %d (%s) 业务调用失败: %v，清理失效会话并尝试重建", acc.ID, acc.OpenID, err)
 	_ = a.db.InvalidateAllSessions(ctx, acc.ID)
 
@@ -1127,10 +1220,10 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 		return result, nil
 	}
 
-	// 4. 重建时若 login_buffer 被拒绝，先尝试按需刷新 login_buffer 再判定 expired
+	// 5. 重建时若 login_buffer 被拒绝，先尝试按需刷新 OAuth 凭据与 login_buffer 再判定 expired
 	log.Printf("[invokeWXApp] 账号 %d (%s) 重建会话后依然失败: %v", acc.ID, acc.OpenID, err)
 	if isLoginBufferExpiredErr(err) {
-		return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err)
+		return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err, firstDiag, autoAuthDiag)
 	}
 
 	// 其它网络超时或短链接波动，不误改账号状态为 expired
