@@ -7,11 +7,24 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"time"
 )
+
+// ShortlinkRejectedError indicates an authenticated MMTLS ShortLink response
+// whose wpkg header reported an explicit non-zero transport or application code
+// (for example, shortlink_application code=-14).
+type ShortlinkRejectedError struct {
+	Stage string
+	Code  int64
+}
+
+func (e *ShortlinkRejectedError) Error() string {
+	return fmt.Sprintf("shortlink_%s rejected: code=%d", e.Stage, e.Code)
+}
 
 var (
 	type8Prefix = []byte{0x00, 0x00, 0x00, 0x10, 0x08, 0x00, 0x00, 0x00, 0x0b, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x12}
@@ -80,6 +93,11 @@ func send0RTT(ctx context.Context, targets []Target, entry pskEntry, recvKey, en
 			return code, resp, nil
 		}
 		if err != nil {
+			var slRej *ShortlinkRejectedError
+			if errors.As(err, &slRej) {
+				// Authenticated ShortLink rejection (e.g. -14) must not be replayed across nodes.
+				return nil, nil, err
+			}
 			last = err
 		} else {
 			last = fmt.Errorf("ShortLink response did not contain application data")
@@ -168,6 +186,7 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 
 	seqs := []uint64{2, 1, 0, 3, 4, 5, 6, 7}
 
+	var rejectedErr error
 	for _, appdata := range allAppData {
 		for _, trans := range candidates {
 			h := sha256.Sum256(trans)
@@ -190,6 +209,13 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 							}
 							return nil, resp, nil
 						}
+						if ints, _, _, herr := decodeWpkgHead(sl.Body); herr == nil {
+							if ints[4] != 0 && rejectedErr == nil {
+								rejectedErr = &ShortlinkRejectedError{Stage: "transport", Code: int64(int32(ints[4]))}
+							} else if ints[23] != 0 && rejectedErr == nil {
+								rejectedErr = &ShortlinkRejectedError{Stage: "application", Code: int64(int32(ints[23]))}
+							}
+						}
 					}
 					if resp, err := sessionDecrypt(ad, recvKey); err == nil {
 						code := extractCode(resp)
@@ -206,6 +232,10 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 		}
 	}
 
+	if rejectedErr != nil {
+		log.Printf("[0RTT] ShortLink 上游返回明确拒绝: %v", rejectedErr)
+		return nil, nil, rejectedErr
+	}
 	log.Printf("[0RTT] parse0RTTResponse AppData 解密失败: records=%d, encHS=%d, appData=%d", len(recs), len(encHS), len(allAppData))
 	return nil, nil, fmt.Errorf("AppData decrypt/parse failed")
 }
