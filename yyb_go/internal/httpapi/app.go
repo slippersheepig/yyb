@@ -81,7 +81,7 @@ func NewApp(cfg Config) (*App, error) {
 		cfg.AvatarTimeout = 10 * time.Second
 	}
 	if cfg.SessionTTL == 0 {
-		cfg.SessionTTL = 6 * time.Hour
+		cfg.SessionTTL = 7 * 24 * time.Hour
 	}
 	if cfg.QRSessionTTL == 0 {
 		cfg.QRSessionTTL = 5 * time.Minute
@@ -149,22 +149,22 @@ func (a *App) autoRefreshAll(ctx context.Context) {
 	now := time.Now().Unix()
 	const refreshWindow = 60 * 60 // 60 minutes before expiry
 	for _, acc := range accounts {
-		// Skip accounts without credentials or already expired
-		if acc.Credentials == nil {
-			continue
-		}
 		if acc.Status != nil && *acc.Status == "expired" {
 			continue
 		}
-		creds := protocol.CredentialsFromMap(acc.Credentials)
-		if creds.RefreshToken == "" {
-			continue // 无 refresh_token 无法通过 UAL 自动刷新，避免错误标记为 expired
+		// 1. 若存在 UAL refresh_token 且 access_token 临近过期，尝试刷新 login_buffer
+		if acc.Credentials != nil {
+			creds := protocol.CredentialsFromMap(acc.Credentials)
+			if creds.RefreshToken != "" && creds.ExpiresAt <= now+refreshWindow {
+				a.refreshOneAccount(ctx, acc)
+			}
 		}
-		// Only refresh if within the refresh window (close to expiry)
-		if creds.ExpiresAt > now+refreshWindow {
-			continue // Still plenty of time, skip
+		// 2. 维护底层 WMPF 会话：确保会话已预热落库，并在外层 MMTLS PSK 临近过期时匿名续期 PSK（保留 AppSession）
+		keepCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		if err := a.pool.KeepSessionFresh(keepCtx, acc.LoginBuffer, acc.ID, a.cfg.TCPProxy, 60*time.Minute); err != nil {
+			log.Printf("[autoRefresh] account %d (%s) WMPF session keep-fresh skipped: %v", acc.ID, acc.OpenID, err)
 		}
-		a.refreshOneAccount(ctx, acc)
+		cancel()
 	}
 }
 
@@ -180,7 +180,9 @@ func (a *App) refreshOneAccount(ctx context.Context, acc *store.WechatAccount) {
 	defer cancel()
 	result, err := a.qr.RefreshLoginBuffer(refreshCtx, creds)
 	if err == nil {
-		_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, result.Credentials.ToMap())
+		acc.LoginBuffer = result.LoginBuffer
+		acc.Credentials = result.Credentials.ToMap()
+		_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, acc.Credentials)
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
 		log.Printf("[autoRefresh] account %d (%s) refreshed OK", acc.ID, acc.OpenID)
 		return
@@ -697,11 +699,13 @@ func (a *App) handleGetH5Code(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := a.pool.GetH5Code(r.Context(), acc.LoginBuffer, appID, redirectURI, scope, state, acc.ID, a.cfg.TCPProxy)
+	result, err := a.invokeWXApp(r.Context(), acc, appID, nil, func(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
+		return a.pool.GetH5Code(ctx, acc.LoginBuffer, appID, redirectURI, scope, state, acc.ID, a.cfg.TCPProxy)
+	})
 	if err != nil {
-		if isLoginBufferExpiredErr(err) {
-			_ = a.db.SetAccountStatus(r.Context(), acc.ID, "expired")
-			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
+		var expired accountExpiredError
+		if errors.As(err, &expired) {
+			writeError(w, http.StatusConflict, expired.clientMessage())
 			return
 		}
 		writeError(w, http.StatusBadGateway, "h5code call failed: "+err.Error())
@@ -775,7 +779,7 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 		var expired accountExpiredError
 		switch {
 		case errors.As(err, &expired):
-			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
+			writeError(w, http.StatusConflict, expired.clientMessage())
 		case strings.Contains(err.Error(), "non-miniprogram AppID"):
 			writeError(w, http.StatusForbidden, err.Error())
 		default:
@@ -876,8 +880,17 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 	if err != nil {
 		return nil, err
 	}
-	// 重新扫码成功，清理上一轮残留的京东二验风险链接
+	// 重新扫码成功，清理旧会话缓存与上一轮残留的京东二验风险链接
+	_ = a.db.InvalidateAllSessions(ctx, acc.ID)
 	_ = a.db.SetJdRiskURL(ctx, acc.ID, "")
+	// 趁刚拿到的 login_buffer 尚在有效期内，立即建立 WMPF 会话并落库，避免后续闲置导致 login_buffer 过期未消费
+	warmupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	if warmErr := a.pool.CheckLiveness(warmupCtx, loginBuffer, acc.ID, a.cfg.TCPProxy); warmErr != nil {
+		log.Printf("[storeFromScan] account %d (%s) session warmup failed (will retry on demand): %v", acc.ID, acc.OpenID, warmErr)
+	} else if refreshedAcc, getErr := a.db.GetAccount(ctx, acc.ID); getErr == nil && refreshedAcc != nil {
+		acc = refreshedAcc
+	}
+	cancel()
 	// Notify Telegram admins about the new login.
 	if a.tgBot != nil && acc != nil {
 		ev := tgbot.NewLoginEvent{
@@ -903,11 +916,25 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
 		return "alive"
 	}
-	// 只有当明确是 manualauth 认证失败/凭据被微信拒绝时，才标记为 expired
+	// 只有当明确是 manualauth 认证失败/凭据被微信拒绝时，先尝试按需刷新 login_buffer 再判定是否 expired
 	if isLoginBufferExpiredErr(err) {
-		log.Printf("[refreshLiveness] 账号 %d (%s) 微信认证已失效: %v", acc.ID, acc.OpenID, err)
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
-		return "expired"
+		if refreshed, reason := a.tryRefreshLoginBuffer(ctx, acc); refreshed {
+			_ = a.db.InvalidateAllSessions(ctx, acc.ID)
+			if retryErr := a.pool.CheckLiveness(ctx, acc.LoginBuffer, acc.ID, proxy); retryErr == nil {
+				_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
+				return "alive"
+			} else if !isLoginBufferExpiredErr(retryErr) {
+				log.Printf("[refreshLiveness] 账号 %d (%s) 刷新 login_buffer 后检测遇到临时错误: %v", acc.ID, acc.OpenID, retryErr)
+			} else {
+				log.Printf("[refreshLiveness] 账号 %d (%s) 刷新 login_buffer 后微信认证仍失效: %v", acc.ID, acc.OpenID, retryErr)
+				_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
+				return "expired"
+			}
+		} else {
+			log.Printf("[refreshLiveness] 账号 %d (%s) 微信认证已失效: %v (%s)", acc.ID, acc.OpenID, err, reason)
+			_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
+			return "expired"
+		}
 	}
 	// 网络超时等临时错误，保持原有状态（默认 alive）
 	currentStatus := "alive"
@@ -929,9 +956,24 @@ func (a *App) resyncProfile(ctx context.Context, acc *store.WechatAccount) (*sto
 	return a.db.GetAccount(ctx, acc.ID)
 }
 
-type accountExpiredError struct{ openid string }
+type accountExpiredError struct {
+	openid string
+	detail string
+}
 
-func (e accountExpiredError) Error() string { return "account expired: " + e.openid }
+func (e accountExpiredError) Error() string {
+	if e.detail != "" {
+		return "account expired: " + e.openid + " (" + e.detail + ")"
+	}
+	return "account expired: " + e.openid
+}
+
+func (e accountExpiredError) clientMessage() string {
+	if e.detail != "" {
+		return "account login_buffer expired (" + e.detail + "); re-scan required"
+	}
+	return "account login_buffer expired (refresh failed); re-scan required"
+}
 
 func isLoginBufferExpiredErr(err error) bool {
 	if err == nil {
@@ -946,41 +988,149 @@ func isLoginBufferExpiredErr(err error) bool {
 		strings.Contains(errStr, "login_buffer expired")
 }
 
+func isNonRetryableBizErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "wx.login returned empty code") ||
+		strings.Contains(msg, "non-miniprogram AppID") ||
+		strings.Contains(msg, "appid must be") ||
+		strings.Contains(msg, "redirect_uri") ||
+		strings.Contains(msg, "scope must be") ||
+		strings.Contains(msg, "state is invalid") {
+		return true
+	}
+	var h5Rej *protocol.ErrH5OAuthBusinessRejected
+	if errors.As(err, &h5Rej) {
+		// 仅对微信会话/登录态超时类错误码触发重建，其余业务拒绝不清空有效会话
+		switch h5Rej.Ret {
+		case -1, -13, -14, -100, -101:
+			return false
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// tryRefreshLoginBuffer attempts to obtain a fresh login_buffer from Tencent UAL
+// when ManualAuth rejects the stored one: first via an unexpired access_token,
+// then via refresh_token if available.
+func (a *App) tryRefreshLoginBuffer(ctx context.Context, acc *store.WechatAccount) (bool, string) {
+	if acc == nil || acc.Credentials == nil {
+		return false, "no stored UAL credentials"
+	}
+	creds := protocol.CredentialsFromMap(acc.Credentials)
+	refreshCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	var errs []string
+	if creds.AccessToken != "" && !creds.Expired(2*time.Minute) {
+		lb, err := a.qr.LoginBuffers().FetchLoginBuffer(refreshCtx, creds)
+		if err == nil && lb != "" && lb != acc.LoginBuffer {
+			acc.LoginBuffer = lb
+			_ = a.db.SetAccountCredential(ctx, acc.ID, lb, creds.ToMap())
+			log.Printf("[loginBufferRefresh] account %d (%s) fetched fresh login_buffer via active access_token", acc.ID, acc.OpenID)
+			return true, ""
+		}
+		if err != nil {
+			errs = append(errs, "fetch_login_buffer: "+err.Error())
+		}
+	}
+	if creds.RefreshToken != "" {
+		res, err := a.qr.RefreshLoginBuffer(refreshCtx, creds)
+		if err == nil && res.LoginBuffer != "" {
+			acc.LoginBuffer = res.LoginBuffer
+			acc.Credentials = res.Credentials.ToMap()
+			_ = a.db.SetAccountCredential(ctx, acc.ID, res.LoginBuffer, acc.Credentials)
+			log.Printf("[loginBufferRefresh] account %d (%s) refreshed login_buffer via UAL refresh_token", acc.ID, acc.OpenID)
+			return true, ""
+		}
+		if err != nil {
+			errs = append(errs, "ual_refresh: "+err.Error())
+		}
+	} else {
+		errs = append(errs, "ual_refresh: missing refresh_token")
+	}
+	return false, strings.Join(errs, "; ")
+}
+
+func (a *App) retryWithFreshLoginBuffer(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall, origErr error) (map[string]any, error) {
+	refreshed, refreshReason := a.tryRefreshLoginBuffer(ctx, acc)
+	if refreshed {
+		_ = a.db.InvalidateAllSessions(ctx, acc.ID)
+		result, retryErr := call(ctx, acc, appID, payload)
+		if retryErr == nil {
+			_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
+			return result, nil
+		}
+		if !isLoginBufferExpiredErr(retryErr) {
+			return nil, retryErr
+		}
+		origErr = retryErr
+		refreshReason = "refreshed login_buffer still rejected"
+	}
+	detail := origErr.Error()
+	if refreshReason != "" {
+		detail += "; " + refreshReason
+	}
+	log.Printf("[invokeWXApp] 账号 %d (%s) 微信凭据已失效: %s", acc.ID, acc.OpenID, detail)
+	_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
+	return nil, accountExpiredError{openid: acc.OpenID, detail: detail}
+}
+
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
 	proxy := a.cfg.TCPProxy
 
-	// 1. 优先使用当前已缓存 session 直接调用
+	// 1. 优先使用当前已缓存 session（外层 PSK 过期时 pool.state 会自动匿名续期 PSK 并保留 AppSession）
 	result, err := call(ctx, acc, appID, payload)
 	if err == nil {
+		if acc.Status == nil || *acc.Status != "alive" {
+			_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
+		}
 		return result, nil
 	}
-	// 空 code 或非小程序拦截属于上游业务拒绝，不能清理会话重复重放
-	if strings.Contains(err.Error(), "wx.login returned empty code") || strings.Contains(err.Error(), "non-miniprogram AppID") {
+	if isNonRetryableBizErr(err) {
 		return nil, err
 	}
-	// loginAndSession 明确返回凭据失效，直接标记 expired，避免无意义二次重放
 	if isLoginBufferExpiredErr(err) {
-		log.Printf("[invokeWXApp] 账号 %d (%s) 微信凭据已失效: %v", acc.ID, acc.OpenID, err)
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
-		return nil, accountExpiredError{openid: acc.OpenID}
+		return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err)
 	}
 
-	// 2. 调用失败，清理失效 session
-	log.Printf("[invokeWXApp] 账号 %d (%s) 业务调用失败: %v，清理失效会话并自动重试", acc.ID, acc.OpenID, err)
-	_ = a.db.InvalidateSession(ctx, acc.ID, proxy)
+	// 2. 若属于传输/0-RTT 层异常（非明确业务码拒绝），先尝试仅匿名刷新外层 MMTLS PSK，尽量保留 AppSession
+	var h5Rej *protocol.ErrH5OAuthBusinessRejected
+	if !errors.As(err, &h5Rej) {
+		if pskErr := a.pool.RefreshSessionPSK(ctx, acc.ID, proxy); pskErr == nil {
+			log.Printf("[invokeWXApp] 账号 %d (%s) 调用失败(%v)，已匿名续期 MMTLS PSK 并重试", acc.ID, acc.OpenID, err)
+			result, err = call(ctx, acc, appID, payload)
+			if err == nil {
+				_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
+				return result, nil
+			}
+			if isNonRetryableBizErr(err) {
+				return nil, err
+			}
+			if isLoginBufferExpiredErr(err) {
+				return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err)
+			}
+		}
+	}
 
-	// 3. 使用 login_buffer 重新建立微信会话并重试调用（pool.state 会自动使用 login_buffer 向微信 MMTLS 登录）
+	// 3. PSK 续期仍无法恢复（说明微信侧 AppSession 已失效），清理会话并使用 login_buffer 重建
+	log.Printf("[invokeWXApp] 账号 %d (%s) 业务调用失败: %v，清理失效会话并尝试重建", acc.ID, acc.OpenID, err)
+	_ = a.db.InvalidateAllSessions(ctx, acc.ID)
+
 	result, err = call(ctx, acc, appID, payload)
 	if err == nil {
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
 		return result, nil
 	}
 
-	// 4. 重试依然失败，判断是否为微信底层鉴权失败
-	log.Printf("[invokeWXApp] 账号 %d (%s) 重试依然失败: %v", acc.ID, acc.OpenID, err)
+	// 4. 重建时若 login_buffer 被拒绝，先尝试按需刷新 login_buffer 再判定 expired
+	log.Printf("[invokeWXApp] 账号 %d (%s) 重建会话后依然失败: %v", acc.ID, acc.OpenID, err)
 	if isLoginBufferExpiredErr(err) {
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
-		return nil, accountExpiredError{openid: acc.OpenID}
+		return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err)
 	}
 
 	// 其它网络超时或短链接波动，不误改账号状态为 expired
