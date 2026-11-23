@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -150,15 +151,24 @@ func (a *App) StartAutoRefresh(ctx context.Context) {
 		return
 	case <-time.After(10 * time.Second):
 	}
-	a.autoRefreshAll(ctx)
+	a.runAutoRefreshSafe(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			a.autoRefreshAll(ctx)
+			a.runAutoRefreshSafe(ctx)
 		}
 	}
+}
+
+func (a *App) runAutoRefreshSafe(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[autoRefresh] recovered panic: %v\n%s", r, string(debug.Stack()))
+		}
+	}()
+	a.autoRefreshAll(ctx)
 }
 
 func (a *App) isUALBackedOff(accountID int64) bool {
@@ -474,7 +484,8 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	img, err := a.qr.GetQRCodeImage(ctx)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		log.Printf("[qr] GetQRCodeImage failed: %v", err)
+		writeError(w, http.StatusFailedDependency, err.Error())
 		return
 	}
 	a.mu.Lock()
@@ -532,7 +543,8 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := a.qr.PollQRCode(r.Context(), sess)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			log.Printf("[qr] PollQRCode failed: %v", err)
+			writeError(w, http.StatusFailedDependency, err.Error())
 			return
 		}
 		if terminalQR(result.Status) {
@@ -752,12 +764,16 @@ func (a *App) handleGetH5Code(w http.ResponseWriter, r *http.Request) {
 		return a.pool.GetH5Code(ctx, acc.LoginBuffer, appID, redirectURI, scope, state, acc.ID, a.cfg.TCPProxy)
 	})
 	if err != nil {
+		log.Printf("[h5code] account %d (%s) app=%s scope=%s failed: %v", acc.ID, acc.OpenID, appID, scope, err)
 		var expired accountExpiredError
 		if errors.As(err, &expired) {
 			writeError(w, http.StatusConflict, expired.clientMessage())
 			return
 		}
-		writeError(w, http.StatusBadGateway, "h5code call failed: "+err.Error())
+		// Return 424 Failed Dependency instead of 502 Bad Gateway so reverse proxies
+		// like Cloudflare pass our structured JSON error body straight through instead
+		// of replacing 502 responses with a generic edge gateway error page.
+		writeError(w, http.StatusFailedDependency, "h5code call failed: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"openid": acc.OpenID, "result": result})
@@ -825,6 +841,7 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 	}
 	result, err := a.invokeWXApp(r.Context(), acc, body.AppID, body.Payload, call)
 	if err != nil {
+		log.Printf("[wxapp] account %d (%s) app=%s failed: %v", acc.ID, acc.OpenID, body.AppID, err)
 		var expired accountExpiredError
 		switch {
 		case errors.As(err, &expired):
@@ -832,7 +849,7 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 		case strings.Contains(err.Error(), "non-miniprogram AppID"):
 			writeError(w, http.StatusForbidden, err.Error())
 		default:
-			writeError(w, http.StatusBadGateway, "call failed: "+err.Error())
+			writeError(w, http.StatusFailedDependency, "call failed: "+err.Error())
 		}
 		return
 	}
@@ -1048,20 +1065,51 @@ func isNonRetryableBizErr(err error) bool {
 		strings.Contains(msg, "appid must be") ||
 		strings.Contains(msg, "redirect_uri") ||
 		strings.Contains(msg, "scope must be") ||
-		strings.Contains(msg, "state is invalid") {
+		strings.Contains(msg, "state is invalid") ||
+		strings.Contains(msg, "h5 oauth:") {
 		return true
 	}
 	var h5Rej *protocol.ErrH5OAuthBusinessRejected
 	if errors.As(err, &h5Rej) {
-		// 仅对微信会话/登录态超时类错误码触发重建，其余业务拒绝不清空有效会话
-		switch h5Rej.Ret {
-		case -1, -13, -14, -100, -101:
-			return false
-		default:
-			return true
-		}
+		// oauth_authorize 已成功解密并返回明确业务拒绝码（如 -1），说明底层会话本身存活；
+		// 绝不因 H5 业务拒绝去消耗一次性 AutoAuth 密钥或清空缓存会话重建。
+		return true
 	}
 	return false
+}
+
+// shouldRebuildSession distinguishes genuine WeChat session/decrypt invalidations
+// from transient network/timeout blips so a brief timeout never burns a rotating
+// AutoAuth key or deletes a healthy cached WMPF AppSession.
+func shouldRebuildSession(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var slRej *protocol.ShortlinkRejectedError
+	if errors.As(err, &slRej) {
+		return true
+	}
+	var h5Rej *protocol.ErrH5OAuthBusinessRejected
+	if errors.As(err, &h5Rej) {
+		return !isNonRetryableBizErr(err)
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "httpdns") {
+		return false
+	}
+	return strings.Contains(msg, "appdata decrypt/parse failed") ||
+		strings.Contains(msg, "response decrypt failed") ||
+		strings.Contains(msg, "missing serverhello/appdata") ||
+		strings.Contains(msg, "empty shortlink response") ||
+		strings.Contains(msg, "did not contain application data")
 }
 
 // tryRefreshLoginBuffer attempts to obtain a fresh login_buffer from Tencent UAL
@@ -1149,6 +1197,10 @@ func (a *App) retryWithFreshLoginBuffer(ctx context.Context, acc *store.WechatAc
 
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
 	proxy := a.cfg.TCPProxy
+	// Bound total per-request recovery budget so serial fallbacks never cascade
+	// past reverse-proxy / client timeouts (preventing opaque gateway 502/504s).
+	ctx, cancel := context.WithTimeout(ctx, 24*time.Second)
+	defer cancel()
 
 	// 1. 优先使用当前已缓存 session（外层 PSK 过期时 pool.state 会自动匿名续期 PSK 并保留 AppSession）
 	result, err := call(ctx, acc, appID, payload)
@@ -1163,6 +1215,9 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	}
 	if isLoginBufferExpiredErr(err) {
 		return a.retryWithFreshLoginBuffer(ctx, acc, appID, payload, call, err)
+	}
+	if ctx.Err() != nil {
+		return nil, err
 	}
 
 	firstDiag := err.Error()
@@ -1187,6 +1242,9 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 			firstDiag = err.Error()
 		}
 	}
+	if ctx.Err() != nil || !shouldRebuildSession(err) {
+		return nil, err
+	}
 
 	// 3. 会话在微信侧失效（如 shortlink_application -14 或会话超时）：
 	//    在删除缓存会话前，优先尝试独立的微信原生 iLink AutoAuth (cmd 3198) 轮换密钥恢复（不依赖 OAuth/login_buffer）
@@ -1208,6 +1266,9 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	} else {
 		autoAuthDiag = "autoauth: " + autoErr.Error()
 		log.Printf("[invokeWXApp] 账号 %d (%s) 原生 AutoAuth 未恢复(%v)，回退 login_buffer 重建", acc.ID, acc.OpenID, autoErr)
+	}
+	if ctx.Err() != nil {
+		return nil, err
 	}
 
 	// 4. 清理失效会话，使用 login_buffer 重建 WMPF 会话
