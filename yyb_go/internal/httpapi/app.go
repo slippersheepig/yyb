@@ -1066,12 +1066,14 @@ func isNonRetryableBizErr(err error) bool {
 		strings.Contains(msg, "redirect_uri") ||
 		strings.Contains(msg, "scope must be") ||
 		strings.Contains(msg, "state is invalid") ||
-		strings.Contains(msg, "h5 oauth:") {
+		strings.Contains(msg, "h5 oauth:") ||
+		strings.Contains(msg, "h5 a8key:") {
 		return true
 	}
 	var h5Rej *protocol.ErrH5OAuthBusinessRejected
-	if errors.As(err, &h5Rej) {
-		// oauth_authorize 已成功解密并返回明确业务拒绝码（如 -1），说明底层会话本身存活；
+	var a8Rej *protocol.ErrH5A8KeyBusinessRejected
+	if errors.As(err, &h5Rej) || errors.As(err, &a8Rej) {
+		// oauth_authorize / ilinkgeta8key 已成功解密并返回明确业务拒绝码，说明底层会话本身存活；
 		// 绝不因 H5 业务拒绝去消耗一次性 AutoAuth 密钥或清空缓存会话重建。
 		return true
 	}
