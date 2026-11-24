@@ -93,10 +93,16 @@ func parseLoginBuffer(loginBufferB64 string) (loginMeta, error) {
 	return meta, nil
 }
 
-func stableAppDeviceID(seed []byte) []byte {
-	in := make([]byte, 0, 16+len(seed))
-	in = append(in, "yyb-app-device:"...)
-	in = append(in, seed...)
+func stableAppDeviceID(instanceSeed, openID string, fallbackSeed []byte) []byte {
+	in := make([]byte, 0, 32+len(instanceSeed)+len(openID)+len(fallbackSeed))
+	in = append(in, "yyb-app-device-v2:"...)
+	if instanceSeed != "" || openID != "" {
+		in = append(in, instanceSeed...)
+		in = append(in, ':')
+		in = append(in, openID...)
+	} else {
+		in = append(in, fallbackSeed...)
+	}
 	sum := sha256.Sum256(in)
 	return sum[:]
 }
