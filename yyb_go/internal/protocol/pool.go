@@ -51,11 +51,13 @@ type WmpfSession struct {
 }
 
 type Pool struct {
-	cfg Config
-	db  *store.DB
+	cfg        Config
+	db         *store.DB
+	deviceSeed string
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	mu       sync.Mutex
+	locks    map[string]*sync.Mutex
+	nextSlot map[int64]time.Time
 
 	loginSem     chan struct{}
 	shortlinkSem chan struct{}
@@ -81,10 +83,16 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	if cfg.MaxLoginConcurrency == 0 {
 		cfg.MaxLoginConcurrency = def.MaxLoginConcurrency
 	}
+	var seed string
+	if db != nil {
+		seed, _ = db.EnsureDeviceSeed(context.Background())
+	}
 	return &Pool{
 		cfg:          cfg,
 		db:           db,
+		deviceSeed:   seed,
 		locks:        map[string]*sync.Mutex{},
+		nextSlot:     map[int64]time.Time{},
 		loginSem:     make(chan struct{}, cfg.MaxLoginConcurrency),
 		shortlinkSem: make(chan struct{}, cfg.MaxShortlinkConcurrency),
 	}
@@ -120,7 +128,11 @@ func (p *Pool) GetH5Code(ctx context.Context, loginBuffer, appID, redirectURI, s
 	authURL := strings.TrimSuffix(fullURL, "#wechat_redirect")
 	h5Mode := strings.ToLower(strings.TrimSpace(os.Getenv("YYB_H5_MODE")))
 	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
-		if h5Mode == "a8key" {
+		// Default directly to independent iLink GetA8Key (cmd 5112, /ilink/ilinkapp/mm/ilinkgeta8key)
+		// rather than sending a non-miniprogram Official Account AppID through wxaruntime_transfer
+		// (0x0b41 / cmd 1254) first, which PC YYB rejects at outer_transfer and risks upstream
+		// OAuth risk-control flags. Set YYB_H5_MODE=1254 or YYB_H5_MODE=auto to try cmd 1254 first.
+		if h5Mode != "1254" && h5Mode != "auto" {
 			return p.getH5CodeViaA8Key(ctx, st, appID, authURL, callback, resolvedScope, resolvedState)
 		}
 		hostAppID := st.Session.HostAppID
@@ -141,9 +153,6 @@ func (p *Pool) GetH5Code(ctx context.Context, loginBuffer, appID, redirectURI, s
 		if err != nil {
 			var h5Rej *ErrH5OAuthBusinessRejected
 			if h5Mode != "1254" && errors.As(err, &h5Rej) && h5Rej.Depth == 0 {
-				// Outer wxaruntime_transfer (0x0b41) refused to forward cmd 1254 before
-				// any OAuth confirmation occurred; fall back once to independent iLink
-				// GetA8Key (cmd 5112) on the same live session.
 				log.Printf("[pool] account %d H5 cmd=1254 rejected at outer_transfer (ret=%d), trying A8Key(5112) fallback", accountID, h5Rej.Ret)
 				a8Res, a8Err := p.getH5CodeViaA8Key(ctx, st, appID, authURL, callback, resolvedScope, resolvedState)
 				if a8Err == nil {
@@ -279,7 +288,50 @@ func (p *Pool) KeepSessionFresh(ctx context.Context, loginBuffer string, account
 	return err
 }
 
+func (p *Pool) minAccountGap() time.Duration {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("YYB_CODE_MIN_GAP")))
+	if raw == "0" || raw == "off" || raw == "false" {
+		return 0
+	}
+	if raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d >= 0 && d <= 30*time.Second {
+			return d
+		}
+	}
+	return 3 * time.Second
+}
+
+func (p *Pool) paceAccount(ctx context.Context, accountID int64) error {
+	gap := p.minAccountGap()
+	if gap <= 0 || accountID <= 0 {
+		return nil
+	}
+	p.mu.Lock()
+	now := time.Now()
+	target := now
+	if next, ok := p.nextSlot[accountID]; ok && next.After(now) {
+		target = next
+	}
+	p.nextSlot[accountID] = target.Add(gap)
+	p.mu.Unlock()
+	wait := time.Until(target)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, op func(context.Context, WmpfSession) (map[string]any, error)) (map[string]any, error) {
+	if err := p.paceAccount(ctx, accountID); err != nil {
+		return nil, err
+	}
 	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
 	st, err := p.state(ctx, loginBuffer, accountID, effective)
 	if err == nil {
@@ -347,7 +399,7 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	defer release(p.loginSem)
 	loginCtx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
 	defer cancel()
-	st, err := p.loginAndSession(loginCtx, loginBuffer, tcpProxy)
+	st, err := p.loginAndSession(loginCtx, loginBuffer, acc.OpenID, tcpProxy)
 	if err != nil {
 		return WmpfSession{}, err
 	}
@@ -437,7 +489,7 @@ func (p *Pool) lockFor(key string) *sync.Mutex {
 	return l
 }
 
-func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string) (WmpfSession, error) {
+func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, openID, tcpProxy string) (WmpfSession, error) {
 	if loginBuffer == "" {
 		return WmpfSession{}, fmt.Errorf("login_buffer is empty")
 	}
@@ -451,7 +503,7 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	if err != nil {
 		return WmpfSession{}, err
 	}
-	appDeviceID := stableAppDeviceID(meta.DeviceID)
+	appDeviceID := stableAppDeviceID(p.deviceSeed, openID, meta.DeviceID)
 	var last error
 	for _, t := range targets {
 		if ctx.Err() != nil {
