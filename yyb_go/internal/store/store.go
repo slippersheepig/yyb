@@ -88,6 +88,12 @@ CREATE TABLE IF NOT EXISTS wx_messages (
     created_at        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wxmsg_acc ON wx_messages(wechat_account_id, is_read);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 `
 
 var defaultFeatures = []Feature{
@@ -213,7 +219,40 @@ func Open(path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if _, err = out.EnsureDeviceSeed(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return out, nil
+}
+
+// EnsureDeviceSeed returns the persistent per-instance random hex seed used to
+// derive isolated per-account protocol device identifiers across restarts.
+func (db *DB) EnsureDeviceSeed(ctx context.Context) (string, error) {
+	var existing string
+	err := db.sql.QueryRowContext(ctx, "SELECT value FROM app_settings WHERE key='device_seed'").Scan(&existing)
+	if err == nil && len(existing) >= 32 {
+		return existing, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	seed, genErr := generateSessionToken()
+	if genErr != nil {
+		return "", genErr
+	}
+	now := time.Now().Unix()
+	_, err = db.sql.ExecContext(ctx,
+		"INSERT INTO app_settings(key, value, updated_at) VALUES('device_seed', ?, ?) ON CONFLICT(key) DO NOTHING",
+		seed, now,
+	)
+	if err != nil {
+		return "", err
+	}
+	if scanErr := db.sql.QueryRowContext(ctx, "SELECT value FROM app_settings WHERE key='device_seed'").Scan(&existing); scanErr == nil && existing != "" {
+		return existing, nil
+	}
+	return seed, nil
 }
 
 func (db *DB) CreateUserSession(ctx context.Context, accountID int64, ttl time.Duration) (string, error) {
